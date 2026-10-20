@@ -17,7 +17,7 @@ player.html           播放壳：iframe + 演示数据投递 + 返回
 devices/a|b|c|d|mv.html   五支装置（单文件，画面 = f(features, t)）
 annotator.html        音轨标注台（浏览器内近似分析；完整 analyze.py 需本地 Python）
 demo/
-  demo.mp3            自制 60s / 96 BPM 演示曲
+  demo.mp3            自制 30s / 96 BPM 演示曲
   features.json       analyze.py 对它的分析结果
   timeline.json       同一份乐谱导出的真值（D 的音符）
   demo.js             base64 音频 + 两个 JSON（file:// 也能投递）

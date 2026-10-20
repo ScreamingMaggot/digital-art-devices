@@ -20,7 +20,7 @@
   #bar button:hover{border-color:#4a5665}
   #view{display:block;width:100%;height:calc(100% - 38px);border:0;background:#070a0d}
   #err{position:fixed;inset:38px 0 0;display:none;align-items:center;justify-content:center;padding:30px;
-    background:rgba(7,10,13,.96);color:#ffb24d;font-size:14px;line-height:1.8;text-align:center;z-index:4}
+    background:rgba(7,10,13,.96);color:#ffb24d;font-size:14px;line-height:1.8;text-align:center;z-index:4;white-space:pre-line}
 </style>
 </head>
 <body>
@@ -33,7 +33,6 @@
 <iframe id="view" allow="autoplay" title="装置"></iframe>
 <div id="err"></div>
 
-<script src="demo/demo.js"></script>
 <script>
 'use strict';
 const NAMES={a:'A · 频谱传动引擎',b:'B · 擒纵调速钟',c:'C · 地层档案压机',d:'D · 音符液压柱',mv:'MV · 分镜夜行'};
@@ -43,53 +42,68 @@ const demo=q.get('demo')!=='0';
 const view=document.getElementById('view'), st=document.getElementById('st'), err=document.getElementById('err');
 document.getElementById('ttl').textContent=NAMES[p]||'演示';
 document.title=(NAMES[p]||'演示')+' · 数字艺术装置';
-
 function fail(msg){err.style.display='flex';err.textContent=msg;st.textContent='出错';}
-if(!window.__DEMO__){
-  fail('没有找到演示数据（demo/demo.js 缺失）。\n可以直接把 devices/'+p+'.html 当单文件打开，再拖入自己的 features.json。');
-}else{
-  view.src='devices/'+p+'.html';
-}
+function setSt(s){st.textContent=s;}
 
-let acked=false, tries=0, timer=null;
-const bundle=()=>{
-  const D=window.__DEMO__;
-  return {kind:'annotator-bundle',v:1,sent_at:new Date().toISOString(),
-    project:{name:D.title||'课堂演示',id:'demo',duration:(D.features&&D.features.source&&D.features.source.duration)||60,
-      bpm:(D.features&&D.features.rhythm&&D.features.rhythm.bpm)||96,
-      bpm_source:'人工输入',feats_from:'demo'},
-    features:D.features,regions:D.regions||[],markers:[]};
-};
+/* 装置页先起；数据/声音并行取。GitHub Pages 实测 ~25KB/s，必须让首屏先出来。 */
+view.src='devices/'+p+'.html';
+let acked=false,tries=0,timer=null,viewReady=false,dataReady=false,audioP=null;
+function loadScript(src){
+  return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;
+    s.onload=()=>res();s.onerror=()=>rej(new Error('加载失败：'+src));document.head.appendChild(s);});
+}
+if(!demo){setSt('未带演示数据');}
+else{
+  setSt('加载演示数据…');
+  loadScript('demo/demo.js').then(()=>{dataReady=true;maybeStart();})
+    .catch(e=>fail('演示数据加载失败：'+e.message+'\n可打开 devices/'+p+'.html 手动拖入 features.json。'));
+  audioP=(location.protocol==='file:')
+    ? loadScript('demo/audio.js').then(()=>{
+        const A=window.__DEMO_AUDIO__;if(!A)throw new Error('audio.js 缺失');
+        return b64buf(A.audio_b64);})
+    : fetch('demo/demo.mp3').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.arrayBuffer();});
+}
 function b64buf(s){
-  const bin=atob(s), u=new Uint8Array(bin.length);
+  const bin=atob(s),u=new Uint8Array(bin.length);
   for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);
   return u.buffer;
 }
-function postAll(){
-  const w=view.contentWindow;if(!w)return;
+function bundle(){
+  const D=window.__DEMO__;
+  return {kind:'annotator-bundle',v:1,sent_at:new Date().toISOString(),
+    project:{name:D.title||'课堂演示',id:'demo',
+      duration:(D.features&&D.features.source&&D.features.source.duration)||30,
+      bpm:(D.features&&D.features.rhythm&&D.features.rhythm.bpm)||96,
+      bpm_source:'人工输入',feats_from:'demo'},
+    features:D.features,regions:D.regions||[],markers:[]};
+}
+function postBundle(){
+  const w=view.contentWindow;if(!w||!window.__DEMO__)return;
   try{w.postMessage(bundle(),'*');}catch(e){fail('投递 bundle 失败：'+e.message);return;}
-  tries++;st.textContent='送入演示数据… 第 '+tries+' 次';
+  if(!acked){tries++;setSt('送入演示数据… 第 '+tries+' 次');}
 }
-function start(){
-  if(!window.__DEMO__)return;
-  acked=false;tries=0;clearInterval(timer);
-  postAll();
-  timer=setInterval(()=>{if(acked||tries>=12){clearInterval(timer);return;}postAll();},500);
-  setTimeout(()=>{if(!acked&&tries>=12){st.textContent='装置没有回执：打开控制台看 JS 错误';}},6600);
+function maybeStart(){
+  if(!dataReady||!viewReady||!demo)return;
+  clearInterval(timer);acked=false;tries=0;
+  postBundle();
+  timer=setInterval(()=>{if(acked||tries>=20){clearInterval(timer);return;}postBundle();},500);
+  setTimeout(()=>{if(!acked){setSt('装置还没回执（网络慢或页面报错）；可点「重送」');}},12000);
 }
+view.addEventListener('load',()=>{viewReady=true;maybeStart();});
+document.getElementById('again').onclick=()=>{acked=false;tries=0;maybeStart();};
 window.addEventListener('message',ev=>{
   const d=ev&&ev.data;if(!d||d.kind!=='annotator-bundle-ack')return;
   if(acked)return;acked=true;clearInterval(timer);
-  const D=window.__DEMO__, w=view.contentWindow;
-  try{
-    w.postMessage({kind:'annotator-timeline',text:JSON.stringify(D.timeline)},'*');
-    const buf=b64buf(D.audio_b64);
-    w.postMessage({kind:'annotator-audio',name:D.audio_name||'demo.mp3',type:D.audio_type||'audio/mpeg',buf:buf},'*');
-    st.textContent='已送入：数据 + timeline + 声音 · 若无声点一下画面';
-  }catch(e){st.textContent='回执已到，但音频/timeline 投递失败：'+e.message;}
+  const D=window.__DEMO__,w=view.contentWindow;
+  try{w.postMessage({kind:'annotator-timeline',text:JSON.stringify(D.timeline)},'*');}catch(e){}
+  setSt('数据已到 · 声音加载中…');
+  audioP.then(buf=>{
+    try{w.postMessage({kind:'annotator-audio',name:D.audio_name||'demo.mp3',
+      type:D.audio_type||'audio/mpeg',buf:buf},'*');
+      setSt('已送入：数据 + timeline + 声音 · 若无声点一下画面');}
+    catch(e){setSt('声音投递失败：'+e.message);}
+  }).catch(e=>setSt('声音未加载：'+e.message+' · 点画面或按空格看默片'));
 });
-view.addEventListener('load',()=>{if(demo)start();else st.textContent='未带演示数据';});
-document.getElementById('again').onclick=()=>start();
 </script>
 </body>
 </html>

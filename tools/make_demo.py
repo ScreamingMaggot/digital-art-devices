@@ -23,7 +23,7 @@ SR = 44100
 BPM = 96.0
 BEAT = 60.0 / BPM          # 0.625
 BAR = 4 * BEAT             # 2.5
-BARS = 24
+BARS = 12
 DUR = BARS * BAR           # 60.0
 N = int(round(DUR * SR))
 rng = np.random.default_rng(20261020)
@@ -124,11 +124,11 @@ def crash() -> np.ndarray:
 # ---------------- 段落 ----------------
 # bars: 0-4 intro, 4-10 build, 10-18 peak, 18-21 break, 21-24 outro
 SECTIONS = [
-    ("intro", 0, 4, 0.22, 0.30, 0.28, 0.12, 0.50),
-    ("build", 4, 10, 0.55, 0.52, 0.50, 0.20, 0.62),
-    ("peak", 10, 18, 0.90, 0.78, 0.70, 0.32, 0.74),
-    ("break", 18, 21, 0.38, 0.44, 0.58, 0.18, 0.46),
-    ("outro", 21, 24, 0.18, 0.32, 0.20, 0.10, 0.38),
+    ("intro", 0, 2, 0.22, 0.30, 0.28, 0.12, 0.50),
+    ("build", 2, 5, 0.55, 0.52, 0.50, 0.20, 0.62),
+    ("peak", 5, 9, 0.90, 0.78, 0.70, 0.32, 0.74),
+    ("break", 9, 10, 0.38, 0.44, 0.58, 0.18, 0.46),
+    ("outro", 10, 12, 0.18, 0.32, 0.20, 0.10, 0.38),
 ]
 
 
@@ -163,8 +163,8 @@ MOTIF = [
     [(0, 67, 1), (1, 69, 1), (2, 72, 2), (4, 71, 1), (5, 69, 1), (6, 67, 2)],
 ]
 mel_notes = []
-for bar in range(4, BARS):
-    if bar >= 18 and bar < 21 and bar % 2 == 1:
+for bar in range(2, BARS):
+    if bar >= 9 and bar < 10 and bar % 2 == 1:
         continue
     phrase = MOTIF[(bar // 2) % 4]
     step = BEAT / 2
@@ -197,13 +197,13 @@ for bar in range(BARS):
             t0 = bar * BAR + beat * BEAT
             if beat in (0, 2):
                 add(kick(), t0, 0.42 if sec[0] != "intro" else 0.26)
-            if beat in (1, 3) and bar >= 4:
+            if beat in (1, 3) and bar >= 3:
                 add(snare(), t0, 0.20 if sec[0] != "peak" else 0.26)
             for half in (0, 1):
                 if bar >= 4 or half == 0:
                     add(hat(open_=(half == 1 and beat == 3)), t0 + half * BEAT / 2,
                         0.045 if sec[0] == "intro" else 0.075, pan=0.25)
-    if bar in (10, 18):
+    if bar in (5, 9):
         add(crash(), bar * BAR, 0.13, pan=-0.2)
 
 # 旋律
@@ -233,7 +233,7 @@ with wave.open(str(wav), "wb") as fh:
 import imageio_ffmpeg
 ff = imageio_ffmpeg.get_ffmpeg_exe()
 mp3 = DEMO / "demo.mp3"
-r = subprocess.run([ff, "-y", "-i", str(wav), "-codec:a", "libmp3lame", "-b:a", "128k", str(mp3)],
+r = subprocess.run([ff, "-y", "-i", str(wav), "-codec:a", "libmp3lame", "-b:a", "80k", str(mp3)],
                    capture_output=True)
 if r.returncode != 0 or not mp3.exists():
     raise SystemExit("mp3 失败: " + r.stderr.decode("utf-8", "replace")[-300:])
@@ -326,10 +326,14 @@ if abs(raw_bpm / BPM - 2.0) < 0.02:
 sugg = (feat.get("structure") or {}).get("suggestions_by_k", {}).get("6", [])
 regions = [{"t0": float(s["start"]), "t1": float(s["end"]), "name": "建议段", "moods": [],
             "func": "", "sev": None, "auto": True, "confirmed": False, "sketch": []} for s in sugg]
-payload = {"audio_b64": audio_b64, "audio_name": "demo.mp3", "audio_type": "audio/mpeg",
+payload = {"audio_src": "demo.mp3", "audio_name": "demo.mp3", "audio_type": "audio/mpeg",
            "features": feat, "timeline": timeline, "regions": regions,
            "title": "课堂演示 · 96 BPM · 自制"}
 js = "window.__DEMO__=" + json.dumps(payload, ensure_ascii=False) + ";\n"
 (DEMO / "demo.js").write_text(js, encoding="utf-8")
+audio_js = ("window.__DEMO_AUDIO__={audio_b64:\"" + audio_b64 +
+            "\",audio_name:\"demo.mp3\",audio_type:\"audio/mpeg\"};\n")
+(DEMO / "audio.js").write_text(audio_js, encoding="utf-8")
 print("ok", "mp3", mp3.stat().st_size, "features", (DEMO / "features.json").stat().st_size,
-      "timeline", (DEMO / "timeline.json").stat().st_size, "demo.js", (DEMO / "demo.js").stat().st_size)
+      "timeline", (DEMO / "timeline.json").stat().st_size, "demo.js", (DEMO / "demo.js").stat().st_size,
+      "audio.js", (DEMO / "audio.js").stat().st_size)

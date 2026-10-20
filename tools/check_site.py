@@ -37,14 +37,20 @@ def check_player(br, base: str, p: str) -> None:
         ctx.close()
         return
     try:
-        fr.wait_for_function("() => window.__BUNDLE__ && window.__BUNDLE__.received", timeout=15000)
+        fr.wait_for_function("() => window.__BUNDLE__ && window.__BUNDLE__.received", timeout=90000)
         st = fr.evaluate("() => ({b:window.__BUNDLE__, s:window.__M.state()})")
         dur = float(st["s"].get("dur") or 0)
-        if abs(dur - 60.0) > 0.1:
-            fails.append("%s: 演示数据 dur=%s（应为 60）" % (p, dur))
+        if abs(dur - 30.0) > 0.1:
+            fails.append("%s: 演示数据 dur=%s（应为 30）" % (p, dur))
         if st["b"].get("error"):
             fails.append("%s: BUNDLE.error=%s" % (p, st["b"]["error"]))
         pg.wait_for_timeout(1200)
+        try:
+            fr.wait_for_function("""() => !!(window.__M.state && window.__M.state().audio)
+              || !!(window.__audios && window.__audios.some(a=>/^blob:/.test(a.src||'')))""",
+              timeout=90000)
+        except Exception:
+            pass
         # 音频是否真的进了装置：找 audio 元素或 blob src
         audio = fr.evaluate("""() => !!(window.__M.state && window.__M.state().audio)
           || !!(window.__audios && window.__audios.some(a=>/^blob:/.test(a.src||'')))""")
@@ -119,7 +125,7 @@ def check_annotator(br, base: str) -> None:
               (st["received"], st["ack_sent"], dur, st["sec_mode"] ))
         if not st["received"] or not st["ack_sent"]:
             fails.append("标注台送包: received/ack 不完整")
-        if abs(float(dur) - 60.0) > 0.2:
+        if abs(float(dur) - 30.0) > 0.2:
             fails.append("标注台送包: 装置 dur=%s" % dur)
         if st.get("error"):
             fails.append("标注台送包: BUNDLE.error=%s" % st["error"])
