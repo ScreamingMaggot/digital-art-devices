@@ -1,0 +1,1562 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>MV · 通用音乐影像 · 分镜夜行</title>
+<style>
+  :root{--bg:#04060a;--ink:#dde5ef;--dim:#8d99aa;--line:#202a36;--amber:#e0a13a;--warm:#ffd29a}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);overflow:hidden;
+    font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
+  canvas{display:block;width:100vw;height:100vh}
+  #hud{position:fixed;left:0;right:0;top:0;display:flex;justify-content:space-between;gap:18px;
+    padding:12px 16px;pointer-events:none;transition:opacity .7s}
+  #hud .l{max-width:52%}
+  #hud .r{max-width:44%;text-align:right}
+  #hud b{display:block;font-size:14px;letter-spacing:.10em;color:#f1f5fa;font-weight:600}
+  #hud .k{font-size:12px;color:var(--dim);margin-top:3px}
+  #hud .s{font-size:12px;color:#b9c6d6;margin-top:3px}
+  #hud .shot{font-size:12px;color:#e8eef6;letter-spacing:.03em}
+  #hud .amber{color:var(--amber)}
+  body.idle #hud{opacity:0}
+  body.idle #drop{opacity:0}
+  #hint{position:fixed;right:16px;bottom:12px;font-size:12px;color:#6f7c8d;pointer-events:none;transition:opacity .7s}
+  body.idle #hint{opacity:.28}
+  #bar{position:fixed;left:0;right:0;bottom:0;height:46px;background:rgba(6,9,14,.92);
+    border-top:1px solid var(--line);display:none;overflow-x:auto;overflow-y:hidden;white-space:nowrap;padding:6px 10px}
+  #bar.on{display:block}
+  #bar .seg{display:inline-block;height:34px;margin-right:2px;border-left:1px solid #3a4859;
+    padding:2px 6px;font-size:11px;line-height:1.35;color:#a9b6c7;vertical-align:top;overflow:hidden}
+  #bar .seg.cur{background:#16202c;color:#f2f6fb;border-left-color:var(--warm)}
+  #bar .seg i{font-style:normal;color:#6f7c8d;display:block;font-size:11px}
+  #toast{position:fixed;left:50%;transform:translateX(-50%);bottom:60px;padding:6px 10px;border:1px solid var(--line);
+    background:rgba(8,12,18,.92);font-size:12px;color:var(--ink);opacity:0;transition:opacity .3s;pointer-events:none}
+  #drop{position:fixed;right:14px;top:64px;font-size:12px;color:#7f8c9d;cursor:pointer;pointer-events:auto}
+  #drop:hover{color:var(--ink)}
+  #drop input{display:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="hud">
+  <div class="l">
+    <b>夜行书 · 分镜实验 H1</b>
+    <div class="k" id="hudData">等待数据：拖入 *.features.json</div>
+    <div class="k" id="hudShot">镜头 —</div>
+    <div class="k" id="srcLine" style="display:none">数据源：未载入</div>
+  </div>
+  <div class="r">
+    <div class="shot" id="hudNow">—</div>
+    <div class="k" id="hudSec">—</div>
+    <div class="k amber" id="hudWarn" style="display:none"></div>
+  </div>
+</div>
+<div id="hint">H 镜头表 · 空格 播放/停 · 0 归零</div>
+<div id="bar"></div>
+<div id="drop">载入数据<input type="file" id="fpFeat" accept=".json"></div>
+<div id="toast"></div>
+<script>
+'use strict';
+/* ============================================================================
+   H1 分镜夜行 —— 假设："差点意思"的根因是五分钟只有一个镜头。
+   本片的做法：按 structure.sections 切镜头表，每个镜头一套景别/机位/构图；
+   段界用硬切（1 帧）或 0.30s 的快速运镜形变（whip，无淡黑）；
+   世界只有一座枯树、一个提灯人、一轮月，但镜头把同一个小世界拆成 16 个取景。
+   画面 = f(features, t)：无墙钟、无 Math.random，随机量一律按帧号哈希。
+   画面合成分两步：场景画在离屏 2D 画布（sceneC），再由 WebGL 后期层（POST）
+   做分离调色 / halation / 色差 / 暗角 / 颗粒后写到 cv。后期同样只吃帧号与数据。
+   ========================================================================== */
+const cv=document.getElementById('stage');
+/* 场景先画在离屏 2D 画布上，再由 POST（WebGL）合成到 cv —— 后期是 f(场景, 帧号)，仍是纯函数 */
+const sceneC=document.createElement('canvas'),ctx=sceneC.getContext('2d');
+const el=id=>document.getElementById(id);
+let W=0,H=0,DPR=1;
+function resize(){
+  DPR=Math.min(2,window.devicePixelRatio||1);
+  W=Math.round(innerWidth*DPR);H=Math.round(innerHeight*DPR);
+  cv.width=W;cv.height=H;cv.style.width=innerWidth+'px';cv.style.height=innerHeight+'px';
+  sceneC.width=W;sceneC.height=H;
+  buildGrain();
+  postResize(W,H);
+}
+addEventListener('resize',()=>{resize();draw();});
+
+/* ---------------- 基础数学（全部确定性） ---------------- */
+const clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+const lerp=(a,b,u)=>a+(b-a)*u;
+const smooth=u=>{u=clamp(u,0,1);return u*u*(3-2*u);};
+const easeOut=u=>1-Math.pow(1-clamp(u,0,1),3);
+const easeInOut=u=>{u=clamp(u,0,1);return u<.5?2*u*u:1-Math.pow(-2*u+2,2)/2;};
+const TAU=Math.PI*2;
+function hash(n){let x=(Math.floor(n)*2654435761)>>>0;x^=x>>>13;x=(x*1274126177)>>>0;return ((x^=x>>>16)>>>0)/4294967296;}
+function rng(seed){let a=(seed|0)>>>0;return function(){a=(a+0x6D2B79F5)|0;let t=Math.imul(a^a>>>15,1|a);t=(t+Math.imul(t^t>>>7,61|t))^t;return ((t^t>>>14)>>>0)/4294967296;};}
+const b64u8=s=>{if(!s)return null;const b=atob(s),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a;};
+const num=(v,d)=>Number.isFinite(+v)?+v:d;          /* 0 是合法值：只在非数字时才回落 */
+const nz=(v,d=1)=>Number.isFinite(v)?(+v).toFixed(d):'—';
+
+/* ---------------- 全局状态 ---------------- */
+const M={t:0,dur:0,fps:30,fr:0,playing:false,F:null,SHOTS:[],secs:[],cuts:[],last:0};
+let CAM={cx:0,cy:0,scale:7,shot:null,u:0};
+let PAL={hue:222,sat:34,top:6,hor:20,warm:0.2};
+/* 光线状态：acc=重音包络（0..1），breath=响度呼吸（-0.4..0.4）。两者都来自数据。 */
+const LIGHT={acc:0,breath:0};
+let SHOT_IDX=-1,SHOT_T0=0,SHOT_T1=1;
+
+/* ---------------- 色（语义）：冷蓝=距离，暖金=人/灯，琥珀=降级说明 ---------------- */
+const C={bg:'#04060a',ink:'#e6edf6',dim:'#8d99aa',moon:'#e9f1ff',moon2:'#b9cbe4',
+  warm:'#ffcf92',core:'#fff4d8',amber:'#e0a13a',paper:'#f2d6a3',paper2:'#c79a63'};
+/* 提灯人的灯（世界单位宽）：比旧版大 40%，近景里灯纸投影 ≥8% 画幅，远景里是画面最亮点 */
+const FIG_LANT=5.3;
+
+/* ---------------- 世界（单位：人高 18，树高 112，地面 y=0） ---------------- */
+const WORLD={ground:0,treeTop:112,treeX:0};
+const TREE=(function(){
+  const segs=[],tips=[],knots=[],rnd=rng(20261020);
+  /* 一根枝 = 一条弧：3–4 段弦，方向沿弧逐步偏转（curv），段内连续收锥。
+     以前每段各自随机抖动 ±0.075rad，整根枝几乎笔直——远景像插在画面里的矛，
+     近景（月亮缝）读成一根穿过画面的直线。现在曲率属于"整根枝"，段与段是接得上的。 */
+  function limb(x,y,ang,len,w,depth,ph,twig){
+    const n=depth>=3?4:3;
+    const curv=(rnd()-0.5)*0.62+Math.cos(ang)*0.06;
+    let cx=x,cy=y;
+    for(let k=0;k<n;k++){
+      const u=(k+0.5)/n,a=ang+curv*u;
+      const l=len/n*(0.90+0.20*rnd())*(k===n-1?0.84:1);
+      const nx=cx+Math.cos(a)*l,ny=cy+Math.sin(a)*l;
+      const w0=Math.max(.17,w*(1-0.40*k/n)),w1=(depth<=0&&k===n-1)?0.03:Math.max(.11,w*(1-0.40*(k+1)/n));
+      segs.push({x0:cx,y0:cy,x1:nx,y1:ny,w0,w1,d:depth,ph});
+      cx=nx;cy=ny;
+      /* 长枝中段抽一根小枝：读成"树"而不是"一条线" */
+      if(twig&&depth>=3&&k===1&&len>17&&rnd()<0.80)
+        limb(cx,cy,ang+curv*u+(rnd()<0.5?0.95:-0.95),len*0.34,w*0.44,depth-2,ph+rnd()*2,false);
+    }
+    if(depth<=0){tips.push({x:cx,y:cy,w:Math.max(.4,w*.55)});return {x:cx,y:cy};}
+    const nch=depth>=4?2:(rnd()<0.5?3:2);
+    for(let k=0;k<nch;k++){
+      const spread=(k-(nch-1)/2)*(0.55+rnd()*0.30);
+      limb(cx,cy,ang+curv+spread,len*(0.60+rnd()*0.18),w*0.63,depth-1,ph+rnd()*2.4,true);
+    }
+    return {x:cx,y:cy};
+  }
+  /* 主干微倾；一条"够月"的长左枝：树不是对称的 Y，它朝月亮伸出去 */
+  limb(0,0,Math.PI/2+0.075,47,10.5,5,0,true);
+  const a1=limb(-0.3,33,Math.PI*0.965,42,4.8,2,1.2,true);
+  const a2=limb(a1.x,a1.y,Math.PI*0.735,24,2.6,2,1.9,true);
+  const a3=limb(a2.x,a2.y,Math.PI*0.625,24,1.9,2,2.7,true);
+  limb(a3.x,a3.y,Math.PI*0.545,20,1.35,1,3.4,true);
+  limb(0.5,30,Math.PI*0.27,27,4.4,4,2.3,true);
+  limb(0.1,42,Math.PI*0.40,23,3.6,4,3.5,true);
+  limb(-0.4,43,Math.PI*0.63,21,3.2,4,4.6,true);
+  /* 地表根盘：不是装饰，是让树干"长进地里"而不是插在纸上。
+     只给四根短而弯的根（depth 0，不再分叉）——以前是细长直刺，远景读成划痕。 */
+  for(let k=0;k<4;k++){
+    const side=k<2?Math.PI:0;
+    const a=side+(k%2-0.5)*0.34;
+    limb(0,0.5,a,3.6+(k%2)*2.1,2.9-(k%2)*0.5,0,5.2+k*0.3,false);
+  }
+  for(let k=0;k<8;k++)knots.push({x:(rnd()-.5)*5.4,y:7+rnd()*33,r:0.6+rnd()*1.05});
+  let bb={x0:9e9,y0:9e9,x1:-9e9,y1:-9e9},cb={x0:9e9,y0:9e9,x1:-9e9,y1:-9e9};
+  for(const s of segs){
+    for(const [x,y] of [[s.x0,s.y0],[s.x1,s.y1]]){
+      bb.x0=Math.min(bb.x0,x);bb.x1=Math.max(bb.x1,x);bb.y0=Math.min(bb.y0,y);bb.y1=Math.max(bb.y1,y);
+      if(y>48){cb.x0=Math.min(cb.x0,x);cb.x1=Math.max(cb.x1,x);cb.y0=Math.min(cb.y0,y);cb.y1=Math.max(cb.y1,y);}
+    }
+  }
+  return {segs,tips,knots,bb,cbb:cb};
+})();
+const HANG=(function(){ /* 挂在枝上的小灯：绑在真实枝干点上，不再悬在半空 */
+  const a=[],rnd=rng(77123),cand=[];
+  for(const s of TREE.segs){
+    if(s.y0>52&&s.y0<100&&Math.abs(s.x0)<46&&Math.abs(s.x1-s.x0)>0.4)cand.push(s);
+  }
+  for(let k=0;k<18&&cand.length;k++){
+    const s=cand[Math.floor(rnd()*cand.length)],u=0.25+0.7*rnd();
+    const x=s.x0+(s.x1-s.x0)*u, y=s.y0+(s.y1-s.y0)*u;
+    a.push({x,y,len:2.0+rnd()*3.4,ph:rnd()*TAU,s:0.8+rnd()*0.5});
+  }
+  return a.sort((p,q)=>q.y-p.y);
+})();
+
+/* ---------------- 数据读取（只吃契约字段） ---------------- */
+let FEAT=null;
+let audioEl=null;
+function loadFeatText(txt){
+  const F=JSON.parse(txt),src=F.source||{};
+  const fr=Math.max(1,+src.frames||0),fps=num(src.fps,30),dur=num(src.duration,fr/fps);
+  const crv={};
+  for(const k of ['rms','onset','flux','cent','rolloff','flatness','lowhigh','tension'])
+    crv[k]=F.curves&&F.curves[k]?b64u8(F.curves[k]):null;
+  const nb=F.bands&&F.bands.n?+F.bands.n:0;
+  const bands=F.bands&&F.bands.data_b64?b64u8(F.bands.data_b64):null;
+  const low=new Float64Array(fr),mid=new Float64Array(fr),high=new Float64Array(fr);
+  if(bands&&nb&&bands.length>=fr*nb){
+    for(let i=0;i<fr;i++){let l=0,m=0,h=0,c1=0,c2=0,c3=0;
+      for(let b=0;b<nb;b++){const v=bands[i*nb+b]/255;
+        if(b<nb*0.12){l+=v;c1++;}else if(b<nb*0.5){m+=v;c2++;}else{h+=v;c3++;}}
+      low[i]=c1?l/c1:0;mid[i]=c2?m/c2:0;high[i]=c3?h/c3:0;}}
+  const rh=F.rhythm||{},st=F.structure||{};
+  const secsRaw=Array.isArray(st.sections)?st.sections:[];
+  let secs=secsRaw.filter(s=>Number.isFinite(+s.start)&&Number.isFinite(+s.end)&&+s.end>+s.start)
+    .map((s,i)=>({start:+s.start,end:+s.end,energy:num(s.energy,.5),bright:num(s.bright,.5),
+      tension:num(s.tension,.5),noise:num(s.noise,.2),lowhigh:num(s.lowhigh,.5),
+      onset_per_s:num(s.onset_per_s,0),raw:s,i}))
+    .sort((a,b)=>a.start-b.start);
+  let secMode='sections';
+  if(!secs.length){ /* 没有分段不冒充：等分成 6 个"未分析"段，界面上写明 */
+    secMode='none';
+    for(let k=0;k<6;k++)secs.push({start:dur*k/6,end:dur*(k+1)/6,energy:.5,bright:.5,tension:.5,
+      noise:.2,lowhigh:.5,onset_per_s:0,raw:null,i:k});
+  }
+  if(secs[0].start>0.4)secs.unshift({start:0,end:secs[0].start,energy:secs[0].energy,bright:secs[0].bright,
+    tension:secs[0].tension,noise:secs[0].noise,lowhigh:secs[0].lowhigh,onset_per_s:0,raw:null,i:-1});
+  const lastS=secs[secs.length-1];
+  if(lastS.end<dur-0.4)secs.push({start:lastS.end,end:dur,energy:lastS.energy,bright:lastS.bright,
+    tension:lastS.tension,noise:lastS.noise,lowhigh:lastS.lowhigh,onset_per_s:0,raw:null,i:-2});
+  const sig=rh.grid_significant===true;
+  let beats=(rh.beats||[]).map(Number).filter(Number.isFinite);
+  let down=(rh.downbeats||[]).map(Number).filter(Number.isFinite);
+  if(!sig){beats=[];down=[];}
+  /* 前缀和：提灯人的步幅 / 行走由 ∫rms 推进（静音即停），不是墙钟 */
+  const cum=new Float64Array(fr+1);
+  for(let i=0;i<fr;i++)cum[i+1]=cum[i]+(crv.rms?crv.rms[i]/255:0);
+  const cumOn=new Float64Array(fr+1);
+  for(let i=0;i<fr;i++)cumOn[i+1]=cumOn[i]+(crv.onset?crv.onset[i]/255:0);
+  FEAT={fr,fps,dur,crv,low,mid,high,bands:!!bands,secs,secMode,
+    allFlat:secs.length>0&&secs.every(s=>!(+s.energy>0.02)),
+    sig,bpm:num(rh.bpm,0)||null,bpmBasis:rh.bpm_basis||'',caveat:rh.caveat||'',
+    beats,down,weights:rh.beat_position_weights||null,
+    cum,cumOn,
+    lyr:(F.lyrics&&F.lyrics.found===true)?(F.lyrics.lines||[]).filter(l=>l&&Number.isFinite(+l.t0)):[],
+    lyrFound:!!(F.lyrics&&F.lyrics.found===true),
+    key:F.key||null,mood:F.mood||null,meter:F.meter||null,
+    name:src.name||'',sourceName:src.name||''};
+  M.fps=fps;M.fr=fr;M.dur=dur;M.F=FEAT;
+  buildAccents();
+  buildShots();
+  buildBar();
+  const warn=[];
+  if(secMode==='none')warn.push('无分段数据');
+  if(!sig)warn.push('拍网格不可信');
+  el('hudData').textContent=(FEAT.name||'未命名')+' · '+nz(dur,1)+'s · '+FEAT.SHOTS_N;
+  el('hudData').classList.toggle('amber',false);
+  el('hudWarn').style.display=warn.length?'block':'none';
+  el('hudWarn').textContent=warn.join(' · ')+'（画面上已如实标注）';
+  el('hudSec').textContent='拍速 '+(FEAT.bpm?nz(FEAT.bpm,2)+' BPM':'未提供')+
+    (sig?'（网格可信）':'（不可信，卡点脉冲停用）')+' · 段落 '+secs.length+' 段'+
+    (secMode==='sections'?'（自动分段）':'（等分，非分析结果）');
+}
+
+/* ---------------- 镜头表：由 sections 切，切点吸附到强拍 ---------------- */
+const ROLE={
+  intro:['treeWide','track','lanternPull','branchPan','treePull'],
+  travel:['track','figureBust','branchPan','canopyUp','treeStrafe'],
+  still:['lanternCore','rootsLow','moonGap','lanternPull','treePull'],
+  climb:['treeStrafe','canopyUp','clusterUp','figureBust','track'],
+  peak:['clusterUp','moonGap','branchPan','canopyUp','lanternPull'],
+  outro:['lanternPull','treePull','rootsLow','treeWide','figureBust']
+};
+function roleFor(pos,e){
+  if(e<0.30&&pos>0.14&&pos<0.86)return 'still';
+  if(pos<0.14)return 'intro';
+  if(pos<0.38)return 'travel';
+  if(pos<0.56)return 'still';
+  if(pos<0.78)return 'climb';
+  if(pos<0.91)return 'peak';
+  return 'outro';
+}
+function nearestDown(t,grid){
+  if(!grid.length)return null;let best=null,bd=1e9;
+  for(const x of grid){const d=Math.abs(x-t);if(d<bd){bd=d;best=x;}}
+  return bd<=3.0?best:null;
+}
+function figXAt(t){
+  if(!FEAT||!FEAT.fr)return -120;
+  const i=clamp(Math.round(t*FEAT.fps),0,FEAT.fr);
+  const p=FEAT.cum[FEAT.fr]>0?FEAT.cum[i]/FEAT.cum[FEAT.fr]:0;
+  return -128+110*p;
+}
+function cumAt(t){
+  if(!FEAT||!FEAT.fr)return 0;
+  const i=clamp(Math.round(t*FEAT.fps),0,FEAT.fr);
+  return FEAT.cum[i];
+}
+function buildShots(){
+  const F=FEAT,shots=[];
+  /* 没有分段数据时不凭空切：一个镜头到底（降级横幅会写明"单镜头"）。
+     等分切 6 段再切镜＝把"没有结构"伪装成有结构，死数据也会自己动。 */
+  if(F.secMode==='none'||F.allFlat){
+    const s=F.secs[0]||{start:0,end:M.dur,energy:0};
+    shots.push({i:0,key:'treeWide',tpl:TPL.treeWide,sec:0,t0:0,t1:M.dur,
+      role:roleFor(0.5,s.energy),mirror:false,vshift:0,nextTrans:'cut'});
+    M.SHOTS=shots;M.cuts=[];F.SHOTS_N='1 镜头（无结构，单镜）';
+    return;
+  }
+  const secs=F.secs;
+  /* 镜头配额按"段落时长 × 能量"分配：安静段一个长镜头（不再为了凑数切），
+     爆发段每 6s 左右一刀。总镜头数钉在 20 左右（≈7.8 切点/分钟），
+     段内仍有 ≥2.6s 的最小镜头长度，过密的切点会被合并。 */
+  const N_TARGET=20, MIN_SHOT=2.6;
+  const w=secs.map(s=>Math.max(0.001,(s.end-s.start)*(0.20+2.2*clamp(s.energy,0,1))));
+  const ws=w.reduce((a,b)=>a+b,0)||1;
+  const quota=secs.map((s,i)=>Math.max(1,Math.round(N_TARGET*w[i]/ws)));
+  let gi=0;
+  for(let si=0;si<secs.length;si++){
+    const s=secs[si],sd=s.end-s.start;
+    const n=clamp(quota[si],1,9);
+    const bounds=[s.start];
+    for(let k=1;k<n;k++){
+      const target=s.start+sd*k/n;
+      const d=nearestDown(target,F.down.length?F.down:(F.beats.length?F.beats:[]));
+      let b=d!==null?d:target;
+      if(b<bounds[bounds.length-1]+MIN_SHOT)b=bounds[bounds.length-1]+MIN_SHOT;
+      if(b>s.end-MIN_SHOT)b=s.end-MIN_SHOT;
+      if(b>bounds[bounds.length-1]+0.2)bounds.push(b);
+    }
+    bounds.push(s.end);
+    for(let k=0;k<bounds.length-1;k++){
+      const t0=bounds[k],t1=bounds[k+1];
+      if(t1-t0<0.6)continue;
+      const pos=(t0+t1)/2/M.dur;
+      const role=roleFor(pos,s.energy);
+      const list=ROLE[role];
+      let key=list[gi%list.length];
+      /* 相邻两镜不要同样的景别，也不要用同一个模板：切点才看得出来 */
+      const prev=shots.length?shots[shots.length-1]:null;
+      if(prev&&(prev.key===key||prev.tpl.size===TPL[key].size)){
+        for(let j=1;j<list.length;j++){
+          const k2=list[(gi+j)%list.length];
+          if(k2!==prev.key&&TPL[k2].size!==prev.tpl.size){key=k2;break;}
+        }
+      }
+      const v=(gi*3+si*5)%4;
+      shots.push({i:gi,key,tpl:TPL[key],sec:si,t0,t1,role,
+        mirror:(v%2===0),vshift:(v===1?1:(v===3?-1:0)),
+        nextTrans:'cut'});
+      gi++;
+    }
+  }
+  /* 段间的转场：能量高于 0.50 的段头用 0.30s 快速运镜形变，其余硬切（1 帧） */
+  for(let k=1;k<shots.length;k++){
+    const a=shots[k-1],b=shots[k];
+    const sec=F.secs[b.sec];
+    const sectionHead=Math.abs(b.t0-sec.start)<0.02;
+    const hot=sec.energy>0.50&&sectionHead;
+    b.nextTrans=(hot&&k<shots.length-1)?'whip':'cut';
+    b.whipFrom=a;
+  }
+  M.SHOTS=shots;M.cuts=shots.map(s=>s.t0).slice(1);
+  F.SHOTS_N=shots.length+' 镜头';
+}
+function shotAt(t){
+  const S=M.SHOTS;if(!S.length)return null;
+  let lo=0,hi=S.length-1;
+  while(lo<hi){const m=(lo+hi)>>1;if(t<S[m].t1)hi=m;else lo=m+1;}
+  return S[clamp(lo,0,S.length-1)];
+}
+
+/* ---------------- 镜头模板：每格一套 (景别, 机位运动, 构图, 焦点) ---------------- */
+const TPL={
+  treeWide:{name:'立树',size:'远景',move:'推',focus:'tree',light:'moon',
+    cam:(u,t,c)=>({cx:-40-6*u,cy:56+3*u,scale:6.55+0.5*(.6+.8*c.e)}),
+    box:()=>({x0:TREE.bb.x0-1,y0:-1,x1:TREE.bb.x1+1,y1:TREE.bb.y1+1})},
+  track:{name:'侧跟·提灯人',size:'中景',move:'横移',focus:'figure',light:'lantern',
+    cam:(u,t,c)=>({cx:figXAt(t)+5.6,cy:9.9+.25*Math.sin(u*2.4),scale:50.5+1.4*u}),
+    box:(t)=>{const x=figXAt(t);return {x0:x-7,y0:0,x1:x+11,y1:19};}},
+  canopyUp:{name:'树冠·仰',size:'全景',move:'俯仰+推',focus:'canopy',light:'moon',
+    cam:(u,t,c)=>({cx:-14+2*u,cy:82+16*u,scale:8.5+0.9*u}),
+    box:()=>({x0:TREE.cbb.x0,y0:Math.max(52,TREE.cbb.y0),x1:TREE.cbb.x1,y1:TREE.cbb.y1})},
+  lanternPull:{name:'提灯·拉',size:'特写',move:'拉',focus:'lantern',light:'lantern',
+    cam:(u,t,c)=>{const x=figXAt(t)+5.6;return {cx:x-2.2+1.8*u,cy:8.8+.4*u,scale:72-8*u};},
+    box:(t)=>{const x=figXAt(t)+5.6;return {x0:x-7,y0:0.6,x1:x+7,y1:14.6};}},
+  rootsLow:{name:'根·俯摇',size:'近景',move:'俯仰',focus:'root',light:'moon',
+    cam:(u,t,c)=>({cx:10-2*u,cy:21-8*u,scale:15.5+0.8*u}),
+    box:()=>({x0:-34,y0:-8,x1:34,y1:30})},
+  branchPan:{name:'枝灯·横移',size:'中景',move:'横移',focus:'branch',light:'lantern',
+    cam:(u,t,c)=>({cx:26-14*u,cy:75+4*u,scale:14.4}),
+    box:()=>({x0:-56,y0:50,x1:56,y1:90})},
+  moonGap:{name:'月·隙',size:'特写',move:'推',focus:'moon',light:'moon',fp:0.7,
+    cam:(u,t,c)=>({cx:-56-2*u,cy:88+2*u,scale:20.5+1.2*u}),
+    box:()=>({x0:-78,y0:76,x1:-52,y1:104})},
+  figureBust:{name:'人·近',size:'近景',move:'推',focus:'figure',light:'lantern',
+    cam:(u,t,c)=>{const x=figXAt(t);return {cx:x+3.4,cy:9.6+.3*u,scale:52.5+2*u};},
+    box:(t)=>{const x=figXAt(t);return {x0:x-7,y0:0,x1:x+11,y1:19};}},
+  clusterUp:{name:'群灯·仰',size:'中景',move:'俯仰',focus:'cluster',light:'lantern',
+    cam:(u,t,c)=>({cx:10-2*u,cy:66+14*u,scale:19.5}),
+    box:()=>({x0:-48,y0:48,x1:48,y1:92})},
+  treePull:{name:'树·拉',size:'全景',move:'拉',focus:'tree',light:'moon',
+    cam:(u,t,c)=>({cx:-22+8*u,cy:54-3*u,scale:7.2-0.6*u}),
+    box:()=>({x0:TREE.bb.x0-1,y0:-1,x1:TREE.bb.x1+1,y1:TREE.bb.y1+1})},
+  lanternCore:{name:'灯芯',size:'大特写',move:'推',focus:'lanternCore',light:'lantern',
+    cam:(u,t,c)=>{const x=figXAt(t)+5.6;return {cx:x+1.2,cy:6.6,scale:120+12*u};},
+    box:(t)=>{const x=figXAt(t)+5.6,y=6.25;return {x0:x-2.2,y0:y-3.2,x1:x+2.2,y1:y+3.0};}},
+  treeStrafe:{name:'树·横移',size:'全景',move:'横移',focus:'tree',light:'moon',
+    cam:(u,t,c)=>({cx:-26-14*u,cy:54,scale:7.15}),
+    box:()=>({x0:TREE.bb.x0-1,y0:-1,x1:TREE.bb.x1+1,y1:TREE.bb.y1+1})}
+};
+/* 模板的横向变体：只挪构图（焦点保持离中线 ≥8% 画幅），不改景别 */
+function variantShift(shot){
+  const m=shot.mirror?-1:1,v=shot.vshift;
+  return {dx:m*v*2.6, ds:m*(v*0.035)};
+}
+
+/* ---------------- 镜头求值（相机 / 释义 / 焦点框） ---------------- */
+const FP_DEFAULT=1;
+function fpOf(shot){return shot&&shot.tpl&&shot.tpl.fp?shot.tpl.fp:1;}
+function camOf(shot,t){
+  if(!shot)return {cx:0,cy:50,scale:7};
+  const u=clamp((t-shot.t0)/Math.max(1e-3,shot.t1-shot.t0),0,1);
+  const sec=FEAT.secs[shot.sec]||{energy:.5};
+  const c={e:sec.energy};
+  const cam=shot.tpl.cam(u,t,c);
+  const v=variantShift(shot);
+  return {cx:cam.cx+v.dx,cy:cam.cy,scale:cam.scale*(1+v.ds),u};
+}
+function focusBoxAt(shot,t,cam){
+  if(!shot)return null;
+  const b=shot.tpl.box(t),s=cam.scale*fpOf(shot);
+  let x0=W/2+(b.x0-cam.cx)*s,y0=H/2-(b.y1-cam.cy)*s;
+  let x1=W/2+(b.x1-cam.cx)*s,y1=H/2-(b.y0-cam.cy)*s;
+  const br=cam.breathe||1,px=cam.px==null?W/2:cam.px,py=cam.py==null?H/2:cam.py;
+  x0=px+(x0-px)*br;x1=px+(x1-px)*br;y0=py+(y0-py)*br;y1=py+(y1-py)*br;
+  return {x0,y0,x1,y1,name:shot.tpl.focus};
+}
+function focusArea(shot,t){
+  const cam=camOf(shot,t),b=focusBoxAt(shot,t,cam);
+  if(!b)return 0;
+  const x0=Math.max(0,b.x0),x1=Math.min(W,b.x1),y0=Math.max(0,b.y0),y1=Math.min(H,b.y1);
+  return Math.max(0,(x1-x0))*Math.max(0,(y1-y0))/(W*H);
+}
+function minFocusArea(){
+  let mn=9;
+  for(const s of M.SHOTS)for(const u of [0.02,0.5,0.98])mn=Math.min(mn,focusArea(s,lerp(s.t0,s.t1,u)));
+  return mn;
+}
+/* 灯占画幅：灯纸（提灯 + 树上挂灯）在屏幕上的投影面积 / 画幅。纯函数，不依赖渲染。 */
+function lanternCoverage(shot,t){
+  if(!shot||!W||!H)return 0;
+  const cam=camOf(shot,t),s=cam.scale;
+  const area=(x0,y0,x1,y1)=>{
+    const X0=W/2+(x0-cam.cx)*s,X1=W/2+(x1-cam.cx)*s;
+    const Y0=H/2-(y1-cam.cy)*s,Y1=H/2-(y0-cam.cy)*s;
+    return Math.max(0,Math.min(W,X1)-Math.max(0,X0))*Math.max(0,Math.min(H,Y1)-Math.max(0,Y0));
+  };
+  let a=0;
+  const fx=figXAt(t)+5.15,ly=6.25,hh=FIG_LANT*1.34;
+  a+=area(fx-FIG_LANT*0.5,ly-hh*0.62,fx+FIG_LANT*0.5,ly+hh*0.57);
+  const sec=secOf(shot.sec);
+  const lit=clamp(3+(sec?sec.i:0)*2+Math.floor(10*clamp(t/M.dur,0,1)),3,16);
+  for(let k=0;k<Math.min(lit,HANG.length);k++){
+    const h=HANG[k],sz=2.9*h.s,hh2=sz*1.34;
+    const by=h.y-h.len;
+    a+=area(h.x-sz*0.5,by-hh2*0.62,h.x+sz*0.5,by+hh2*0.57);
+  }
+  return a/(W*H);
+}
+
+/* ---------------- 数据取样 ---------------- */
+const fi=t=>Math.max(0,Math.min((FEAT?FEAT.fr:1)-1,Math.floor(t*(FEAT?FEAT.fps:30)+0.5)));
+const at=(a,i)=>a&&a.length?Math.min(255,a[Math.max(0,Math.min(i,a.length-1))])/255:0;
+const sm=(a,i,k)=>{let s=0,c=0;for(let j=i-k;j<=i+k;j++){s+=at(a,j);c++;}return c?s/c:0;};
+function secAt(t){const s=FEAT.secs;for(let i=0;i<s.length;i++)if(t>=s[i].start&&t<s[i].end)return i;return s.length-1;}
+function secOf(i){return FEAT.secs[clamp(i,0,FEAT.secs.length-1)];}
+function beatIdx(t){ /* 最近拍点距离（秒） */
+  if(!FEAT.sig||!FEAT.beats.length)return 9;
+  let lo=0,hi=FEAT.beats.length-1;
+  while(lo<hi){const m=(lo+hi)>>1;if(FEAT.beats[m]<t)lo=m+1;else hi=m;}
+  let d=1e9;
+  for(const k of [lo-1,lo,lo+1])if(k>=0&&k<FEAT.beats.length)d=Math.min(d,Math.abs(FEAT.beats[k]-t));
+  return d;
+}
+
+/* ---------------- 重音：只有 onset>0.55 的局部峰才算事件 ----------------
+   旧版在拍点闪 1 帧（0.016s）白，5fps 采样根本抓不到，与 onset 的相关只有 0.09。
+   现在：onset>0.55、局部峰、0.80s 不应期（全曲 112 次 <120，不会频闪），
+   每次给整幅一记加色（alpha 0.10–0.14，下拍更重），指数余晖 0.20s（下拍 0.25s）。
+   帧号→事件的映射是纯查表，不依赖播放状态。 */
+function buildAccents(){
+  const F=FEAT;F.acc=[];F.accN=0;
+  if(!F||!F.crv.onset)return;
+  const on=F.crv.onset,n=F.fr,TH=0.55,REFR=0.80,WIN=2;
+  let last=-9;
+  for(let i=1;i<n-1;i++){
+    const v=on[i]/255;
+    if(v<=TH)continue;
+    let peak=true;
+    for(let j=Math.max(0,i-WIN);j<=Math.min(n-1,i+WIN);j++)if(on[j]>on[i]){peak=false;break;}
+    if(!peak)continue;
+    const t=i/F.fps;
+    if(t-last<REFR)continue;
+    last=t;
+    let down=false;
+    if(F.down.length){
+      let lo=0,hi=F.down.length-1;
+      while(lo<hi){const m=(lo+hi)>>1;if(F.down[m]<t)lo=m+1;else hi=m;}
+      down=Math.abs(F.down[lo]-t)<0.11;
+    }
+    F.acc.push({t,s:clamp((v-TH)/0.40,0,1),down});
+    F.accN++;
+  }
+}
+/* 返回 {v:包络 0..1, alpha:整幅加色的 alpha}；无重音时 v=0 */
+function accentAt(t){
+  const A=FEAT&&FEAT.acc;
+  if(!A||!A.length)return {v:0,alpha:0};
+  let lo=0,hi=A.length-1,idx=-1;
+  while(lo<=hi){const m=(lo+hi)>>1;if(A[m].t<=t){idx=m;lo=m+1;}else hi=m-1;}
+  let v=0,al=0,downHit=false;
+  for(let k=idx;k>=0&&k>idx-5;k--){
+    const dt=t-A[k].t;
+    if(dt>1.5)break;
+    const tau=A[k].down?0.25:0.20;
+    const e=Math.exp(-dt/tau);
+    if(A[k].s*e>v){v=A[k].s*e;al=(0.100+0.025*A[k].s+(A[k].down?0.015:0))*e;downHit=!!A[k].down;}
+  }
+  return {v:clamp(v,0,1),alpha:clamp(al,0,0.14),down:downHit};
+}
+/* 响度包络（±0.33s）：整幅光线的"呼吸"跟着它，不是跟墙钟 */
+function rmsEnv(t){return FEAT?sm(FEAT.crv.rms,fi(t),10):0.5;}
+
+/* ---------------- 文字账本（与四台装置同一套反假绿判据） ---------------- */
+const LG={boxes:[],st:{},
+  reset(){this.boxes=[];this.st={checked:0,drawn:0,collisions:0,overlap_events:0,ellipsis:0,minfont:1e9};},
+  overlaps(b){let n=0;for(const o of this.boxes)if(b.x0<o.x1&&b.x1>o.x0&&b.y0<o.y1&&b.y1>o.y0)n++;return n;},
+  note(x,y,w,txt,size,align){this.st.checked++;
+    const x0=align==='left'?x:(align==='right'?x-w:x-w/2);
+    const b={x0,y0:y-size*1.02,x1:x0+w,y1:y+size*0.28};
+    const hit=this.overlaps(b);if(hit){this.st.collisions++;this.st.overlap_events+=hit;}
+    if(/[…]|(\.\.\.)/.test(txt))this.st.ellipsis++;
+    this.st.minfont=Math.min(this.st.minfont,size);this.st.drawn++;this.boxes.push(b);return b;}
+};
+let LEDGER_PROBE=null;
+(function(){
+  LG.reset();const a={x0:100,y0:100,x1:200,y1:130};LG.boxes.push(a);
+  const same=LG.overlaps({x0:100,y0:100,x1:200,y1:130});
+  const far=LG.overlaps({x0:800,y0:600,x1:900,y1:640});
+  LG.reset();LG.note(300,300,200,'ZZZZZZZZZZ',16);LG.note(300,300,200,'ZZZZZZZZZZ',16);
+  const e2e=LG.st.overlap_events;LG.reset();
+  LEDGER_PROBE={detected:same,clean:far,e2e,ok:(same===1&&far===0&&e2e>=1)};
+})();
+
+/* ---------------- 天空 / 调色 ---------------- */
+function paletteFor(sec,idx){
+  const mode=FEAT.key&&FEAT.key.mode==='major'?'major':(FEAT.key&&FEAT.key.mode==='minor'?'minor':'none');
+  const hue0=mode==='major'?198:(mode==='minor'?226:214);
+  const hue=hue0+9*sec.bright-16*sec.tension;
+  const sat=clamp(30+26*sec.bright-16*sec.tension,16,58);
+  const top=3.2+4.2*sec.energy+3.6*(1-sec.tension)+4*sec.bright;
+  const hor=9+11*sec.energy+11*sec.bright;
+  return {hue,sat,top,hor,mode};
+}
+function skyDraw(pal,i,rms){
+  const horY=Math.min(H*1.1,H/2+CAM.cy*CAM.scale);
+  const br=1+LIGHT.breath*0.62;          /* 夜空跟着响度呼吸：亮段天更亮，暗段更沉 */
+  const g=ctx.createLinearGradient(0,0,0,Math.max(horY,H*0.35));
+  g.addColorStop(0,'hsl('+pal.hue.toFixed(1)+','+(pal.sat*0.85).toFixed(0)+'%,'+(pal.top*(0.75+0.5*rms)*br).toFixed(1)+'%)');
+  g.addColorStop(0.62,'hsl('+(pal.hue+10).toFixed(1)+','+(pal.sat*0.7).toFixed(0)+'%,'+(pal.hor*0.45*br).toFixed(1)+'%)');
+  g.addColorStop(1,'hsl('+(pal.hue+18).toFixed(1)+','+(pal.sat*0.55).toFixed(0)+'%,'+(pal.hor*0.72*br).toFixed(1)+'%)');
+  ctx.fillStyle=g;ctx.fillRect(0,0,W,Math.max(horY,1));
+  /* 地平线暖光：亮段才给暖，暗段只有冷雾（颜色语义：暖=有生命/有灯的地方） */
+  const warmAmt=clamp((pal.top+pal.hor)/40,0,1)*clamp((pal.hue<215?0.8:0.45)+0.4*(1-pal.sat/60),0,1);
+  const gg=ctx.createLinearGradient(0,horY-H*0.22,0,horY+H*0.02);
+  gg.addColorStop(0,'rgba(0,0,0,0)');
+  gg.addColorStop(0.72,'rgba(214,176,122,'+((0.05+0.12*warmAmt)*(1+0.55*LIGHT.breath)).toFixed(3)+')');
+  gg.addColorStop(1,'rgba(180,196,220,'+(0.05+0.04*(1-warmAmt)).toFixed(3)+')');
+  ctx.fillStyle=gg;ctx.fillRect(0,horY-H*0.22,W,H*0.24);
+}
+
+/* ---------------- 图层变换：视差 p（<1 远，1 主体，>1 前）
+   主体呼吸 breathe 只绕焦点（px,py）缩放：焦点在画面里的位置不漂，
+   背景与前景都跟着同一比例呼吸——是镜头呼吸，不是整帧抽搐。 ---------------- */
+function layer(p){
+  const b=CAM.breathe||1,px=CAM.px==null?W/2:CAM.px,py=CAM.py==null?H/2:CAM.py;
+  const s=CAM.scale*p*b;
+  ctx.setTransform(s,0,0,-s,
+    px+(W/2-px)*b-CAM.cx*s,
+    py+(H/2-py)*b+CAM.cy*s);
+}
+function resetT(){ctx.setTransform(1,0,0,1,0,0);}
+
+/* ---------------- 星 / 月 / 云 / 远山 ---------------- */
+function starsDraw(i,t,pal,sec){
+  layer(0.12);
+  const n=130;
+  for(let k=0;k<n;k++){
+    const x=-420+hash(k*3.1)*840,y=25+hash(k*7.7)*250;
+    const tw=0.35+0.65*Math.pow(0.5+0.5*Math.sin(t*(0.6+hash(k*2.2)*1.8)+k),2);
+    const a=(0.10+0.42*at(FEAT.crv.flatness,i)+0.10*sec.noise)*tw;
+    ctx.fillStyle='rgba(214,228,248,'+clamp(a,0,0.85).toFixed(3)+')';
+    const r=0.55+hash(k*5.3)*1.05;
+    ctx.beginPath();ctx.arc(x,y,r,0,TAU);ctx.fill();
+  }
+}
+function moonDraw(i,t,pal,rms){
+  layer(0.70);
+  const mx=-78,my=98,r=13;
+  const dim=CAM.scale<13?0.90:1;   /* 远景里把月亮压一点：画面最亮点留给灯 */
+  const g=ctx.createRadialGradient(mx,my,r*0.5,mx,my,r*13);
+  g.addColorStop(0,'rgba(206,222,244,'+((0.26+0.10*rms)*(1+0.5*LIGHT.breath)).toFixed(2)+')');
+  g.addColorStop(0.16,'rgba(170,194,224,'+((0.085+0.05*rms)*(1+0.5*LIGHT.breath)).toFixed(3)+')');
+  g.addColorStop(0.55,'rgba(132,160,196,0.020)');
+  g.addColorStop(1,'rgba(120,150,190,0)');
+  ctx.fillStyle=g;ctx.beginPath();ctx.arc(mx,my,r*13,0,TAU);ctx.fill();
+  /* 月盘：不是纯白圆——上缘冷、下缘略暖，带极淡的月海 */
+  ctx.save();
+  ctx.beginPath();ctx.arc(mx,my,r,0,TAU);ctx.clip();
+  ctx.globalAlpha=dim;
+  const d=ctx.createLinearGradient(mx-r*0.7,my-r*0.7,mx+r*0.8,my+r*0.9);
+  d.addColorStop(0,'#fbfcfe');d.addColorStop(0.55,'#eef3fa');d.addColorStop(1,'#dbe5f1');
+  ctx.fillStyle=d;ctx.fillRect(mx-r,my-r,r*2,r*2);
+  for(let k=0;k<8;k++){
+    const a=hash(k*9.1)*TAU,dd=hash(k*4.7)*r*0.62;
+    const gx=mx+Math.cos(a)*dd,gy=my+Math.sin(a)*dd,gr=r*(0.16+hash(k*6.3)*0.22);
+    const gg=ctx.createRadialGradient(gx,gy,0,gx,gy,gr);
+    gg.addColorStop(0,'rgba(176,194,218,'+(0.10+0.07*hash(k*2.9)).toFixed(3)+')');
+    gg.addColorStop(1,'rgba(176,194,218,0)');
+    ctx.fillStyle=gg;ctx.beginPath();ctx.arc(gx,gy,gr,0,TAU);ctx.fill();
+  }
+  const limb=ctx.createRadialGradient(mx-r*0.2,my-r*0.25,r*0.55,mx,my,r*1.15);
+  limb.addColorStop(0,'rgba(210,222,238,0)');limb.addColorStop(1,'rgba(188,203,224,0.30)');
+  ctx.fillStyle=limb;ctx.fillRect(mx-r,my-r,r*2,r*2);
+  ctx.restore();
+  /* 月前的薄云：只在离月较近的时候（大特写/仰拍）出现，给月亮一点空气 */
+  if(CAM.scale>13){
+    for(let k=0;k<3;k++){
+      const yy=my+(hash(k*7.7)-0.5)*r*1.5, off=((t*(1.4+hash(k)*1.2)+hash(k*3.3)*30)%30)-15;
+      const gg=ctx.createLinearGradient(mx-14,0,mx+14,0);
+      gg.addColorStop(0,'rgba(190,206,228,0)');
+      gg.addColorStop(0.5,'rgba(190,206,228,'+(0.035+0.03*hash(k*2.2)).toFixed(3)+')');
+      gg.addColorStop(1,'rgba(190,206,228,0)');
+      ctx.fillStyle=gg;ctx.fillRect(mx-14+off,yy,r*1.4,1.1+hash(k*5.1)*1.8);
+    }
+  }
+}
+function cloudsDraw(i,t,pal){
+  layer(0.36);
+  for(let k=0;k<7;k++){
+    const y=48+hash(k*8.3)*120,x=-360+((hash(k*2.9)*720+t*(1.2+hash(k)*2.2))%760)-60;
+    const w=90+hash(k*4.4)*180,h=5+hash(k*6.1)*9;
+    const g=ctx.createRadialGradient(x,y,1,x,y,w*0.5);
+    g.addColorStop(0,'rgba(186,204,228,'+(0.035+0.045*hash(k*3.3)).toFixed(3)+')');
+    g.addColorStop(1,'rgba(160,182,210,0)');
+    ctx.save();ctx.translate(x,y);ctx.scale(1,h/w*6);ctx.translate(-x,-y);
+    ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,w*0.5,0,TAU);ctx.fill();ctx.restore();
+  }
+}
+function ridgesDraw(i,t,pal,rms,sec){
+  const cfg=[[0.52,-6,9,'rgba(30,42,58,0.95)'],[0.64,-2,13,'rgba(19,27,40,0.97)'],[0.76,1,17,'rgba(10,15,24,1)']];
+  for(let L=0;L<3;L++){
+    const [p,base,amp,col]=cfg[L];
+    layer(p);
+    ctx.fillStyle=col;ctx.beginPath();ctx.moveTo(-520,-900);
+    for(let x=-520;x<=520;x+=6){
+      const k=0.5+0.5*Math.sin(x*0.035+L*2.1+t*0.11+hash(L*3.7)*6)
+        +0.28*Math.sin(x*0.093+L*1.3-t*0.07)
+        +0.13*Math.sin(x*0.41+L*0.7);
+      const y=base+amp*k*(0.55+0.45*rms)*(1-L*0.12);
+      ctx.lineTo(x,y);
+    }
+    ctx.lineTo(520,-900);ctx.closePath();ctx.fill();
+  }
+}
+
+/* ---------------- 地面 / 前草 / 树 ---------------- */
+function groundDraw(i,t,pal,sec){
+  layer(1);
+  ctx.fillStyle='#06090f';
+  ctx.beginPath();ctx.moveTo(-900,0);
+  for(let x=-900;x<=900;x+=6){
+    const y=-0.6+0.55*Math.sin(x*0.028+t*0.05)+0.25*Math.sin(x*0.11);
+    ctx.lineTo(x,y);
+  }
+  ctx.lineTo(900,-900);ctx.lineTo(-900,-900);ctx.closePath();ctx.fill();
+  /* 近地平线的薄雾：把树根与远山分开 */
+  resetT();
+  const hy=H/2+CAM.cy*CAM.scale;
+  const g=ctx.createLinearGradient(0,hy-H*0.09,0,hy+H*0.05);
+  g.addColorStop(0,'rgba(160,180,206,0)');
+  g.addColorStop(0.55,'rgba(160,180,206,'+((0.045+0.10*at(FEAT.crv.rms,i)*sec.bright)*(1+0.7*LIGHT.breath)).toFixed(3)+')');
+  g.addColorStop(1,'rgba(160,180,206,0)');
+  ctx.fillStyle=g;ctx.fillRect(0,hy-H*0.09,W,H*0.14);
+}
+function swayAt(y,ph,t,amp){
+  return amp*Math.pow(clamp(y/110,0,1),1.7)*Math.sin(t*0.62+ph+y*0.045);
+}
+function segPts(s,t,wind){
+  return [s.x0+swayAt(s.y0,s.ph,t,wind),s.y0,s.x1+swayAt(s.y1,s.ph,t,wind),s.y1];
+}
+function treeDraw(i,t,wind,pal,sec){
+  layer(1);
+  const sc=CAM.scale, px=1/sc;
+  const segs=TREE.segs;
+  const mg=ctx.createRadialGradient(0,0.4,0.4,0,0.4,17);
+  mg.addColorStop(0,'rgba(2,4,9,0.95)');mg.addColorStop(0.55,'rgba(2,4,9,0.60)');mg.addColorStop(1,'rgba(2,4,9,0)');
+  ctx.fillStyle=mg;ctx.beginPath();ctx.ellipse(0,0.4,17,3.1,0,0,TAU);ctx.fill();
+  /* 剪影：黑到几乎吞掉天空；边缘的锥度靠四边形做，不用圆头粗线 */
+  ctx.fillStyle='#020409';
+  ctx.beginPath();
+  for(const s of segs){
+    const [x0,y0,x1,y1]=segPts(s,t,wind);
+    const dx=x1-x0,dy=y1-y0,L=Math.hypot(dx,dy)||1e-3,nx=-dy/L*0.5,ny=dx/L*0.5;
+    const w0=Math.max(0.24,s.w0),w1=Math.max(0.18,s.w1);
+    ctx.moveTo(x0+nx*w0,y0+ny*w0);ctx.lineTo(x1+nx*w1,y1+ny*w1);
+    ctx.lineTo(x1-nx*w1,y1-ny*w1);ctx.lineTo(x0-nx*w0,y0-ny*w0);ctx.closePath();
+  }
+  ctx.fill();
+  /* 关节补洞必须二次填：同一次 fill 里圆弧绕向与四边形相反，会被扣成亮斑 */
+  ctx.beginPath();
+  for(const s of segs){
+    const [x0,y0]=segPts(s,t,wind);
+    if(s.w0*sc<2)continue;
+    const r=s.w0*0.5;
+    ctx.moveTo(x0+r,y0);ctx.arc(x0,y0,r,0,TAU);
+  }
+  ctx.fill();
+  /* 树皮：只落在主干段（y<42），不再沿着整棵树往上长成"梳齿" */
+  if(sc>9){
+    const tp=new Path2D();
+    for(const s of segs)if(s.d>=4&&s.y0<42&&s.w0>1.4){
+      const [x0,y0,x1,y1]=segPts(s,t,wind);
+      const dx=x1-x0,dy=y1-y0,L=Math.hypot(dx,dy)||1e-3,nx=-dy/L*0.5,ny=dx/L*0.5;
+      tp.moveTo(x0+nx*s.w0,y0+ny*s.w0);tp.lineTo(x1+nx*s.w1,y1+ny*s.w1);
+      tp.lineTo(x1-nx*s.w1,y1-ny*s.w1);tp.lineTo(x0-nx*s.w0,y0-ny*s.w0);tp.closePath();
+    }
+    ctx.save();ctx.clip(tp);
+    ctx.strokeStyle='rgba(128,148,172,0.085)';ctx.lineWidth=0.16;
+    for(let k=0;k<34;k++){
+      const x=(hash(k*7.3)-0.5)*7.4,y0=1+hash(k*3.1)*34,h=3+hash(k*9.2)*8;
+      ctx.beginPath();ctx.moveTo(x,y0);
+      ctx.quadraticCurveTo(x+(hash(k*2.2)-.5)*0.9,y0+h*0.5,x+(hash(k*5.5)-.5)*0.6,y0+h);ctx.stroke();
+    }
+    ctx.restore();
+    ctx.fillStyle='rgba(2,4,9,0.55)';
+    for(const kn of TREE.knots){
+      ctx.beginPath();ctx.ellipse(kn.x,kn.y,kn.r,kn.r*1.5,0,0,TAU);ctx.fill();
+    }
+  }
+  /* 月光轮廓：只描"朝向月亮的那条边"，1 屏幕像素宽，不再包一圈灰塑料 */
+  const mx=-78,my=98;
+  const rq=[];
+  for(const s of segs){
+    const [x0,y0,x1,y1]=segPts(s,t,wind);
+    const dx=x1-x0,dy=y1-y0,L=Math.hypot(dx,dy)||1;
+    rq.push({x0,y0,dx,dy,L,w0:s.w0,w1:s.w1});
+  }
+  const covered=(px,py,self)=>{     /* 这条边是不是藏在别的枝干后面 */
+    for(let j=0;j<rq.length;j++){
+      if(j===self)continue;
+      const q=rq[j];
+      const u=((px-q.x0)*q.dx+(py-q.y0)*q.dy)/q.L;
+      if(u<0.04||u>q.L-0.04)continue;
+      const v=((px-q.x0)*(-q.dy)+(py-q.y0)*q.dx)/q.L;
+      const w=(q.w0+(q.w1-q.w0)*u/q.L)*0.5-0.02;
+      if(Math.abs(v)<w)return true;
+    }
+    return false;
+  };
+  ctx.strokeStyle='rgba(201,222,250,'+(0.07+0.09*at(FEAT.crv.rms,i)).toFixed(3)+')';
+  ctx.lineWidth=Math.max(1,1.1*DPR)*px;
+  ctx.beginPath();
+  for(let si=0;si<segs.length;si++){
+    const s=segs[si];
+    if(sc>16||s.w0*sc<5)continue;
+    const [x0,y0,x1,y1]=segPts(s,t,wind);
+    const dx=x1-x0,dy=y1-y0,L=Math.hypot(dx,dy)||1;
+    let nx=-dy/L,ny=dx/L;
+    const mxx=(x0+x1)/2,myy=(y0+y1)/2;
+    if(nx*(mx-mxx)+ny*(my-myy)<0){nx=-nx;ny=-ny;}
+    const o0=s.w0*0.5,o1=s.w1*0.5;
+    let hide=0;
+    for(const u of [0.22,0.5,0.78]){
+      const o=o0+(o1-o0)*u;
+      if(covered(x0+dx*u+nx*o,y0+dy*u+ny*o,si))hide++;
+    }
+    if(hide===3)continue;
+    if(hide===0){
+      ctx.moveTo(x0+nx*o0,y0+ny*o0);ctx.lineTo(x1+nx*o1,y1+ny*o1);
+    }else{
+      /* 半遮半露：只画露出来的小段，别让轮廓线横穿别的枝干 */
+      const N=Math.max(6,Math.min(18,Math.round(L*sc/8)));
+      for(let k=0;k<N;k++){
+        const ua=k/N,ub=(k+1)/N;
+        const oa=o0+(o1-o0)*ua,ob=o0+(o1-o0)*ub;
+        if(covered(x0+dx*ua+nx*oa,y0+dy*ua+ny*oa,si))continue;
+        if(covered(x0+dx*ub+nx*ob,y0+dy*ub+ny*ob,si))continue;
+        ctx.moveTo(x0+dx*ua+nx*oa,y0+dy*ua+ny*oa);
+        ctx.lineTo(x0+dx*ub+nx*ob,y0+dy*ub+ny*ob);
+      }
+    }
+  }
+  ctx.stroke();
+  /* 树上挂的小灯：亮起数 = 走过段数；灯身随拍点摆动（事件驱动的衰减振荡）
+     灯大一圈（2.9），中景/群灯镜头里灯群才占得住画幅；吊绳只在能看清的景别里画 */
+  const lit=clamp(3+(sec?sec.i:0)*2+Math.floor(10*clamp(t/M.dur,0,1)),3,16);
+  for(let k=0;k<Math.min(lit,HANG.length);k++){
+    const h=HANG[k];
+    const sw=0.55*Math.sin(t*1.1+h.ph)*(0.4+wind);
+    const ax=h.x+swayAt(h.y,h.ph,t,wind), ay=h.y;
+    const bx=ax+sw, by=ay-h.len;
+    if(sc>8){
+      ctx.strokeStyle='rgba(118,104,86,0.55)';ctx.lineWidth=0.09;
+      ctx.beginPath();ctx.moveTo(ax,ay);ctx.lineTo(bx,by);ctx.stroke();
+    }
+    lanternDraw(bx,by,2.9*h.s,t,k,0.62);
+  }
+}
+/* 灯：纸壳 + 竖骨 + 芯火 + additive 光晕。scale=灯身宽（世界单位） */
+function lanternDraw(x,y,sz,t,seed,alpha){
+  const w=sz,h=sz*1.34;
+  const fl=0.72+0.28*Math.sin(t*7.3+seed*2.7)+0.12*Math.sin(t*13.1+seed);
+  const a=clamp(alpha,0,1);
+  /* 光晕：用 lighter 叠光，不把前面的人物/树"染成米色" */
+  const g=ctx.createRadialGradient(x,y,sz*0.18,x,y,sz*5.2);
+  g.addColorStop(0,'rgba(255,212,150,'+(0.40*a*fl).toFixed(3)+')');
+  g.addColorStop(0.32,'rgba(255,180,104,'+(0.13*a*fl).toFixed(3)+')');
+  g.addColorStop(1,'rgba(255,150,70,0)');
+  ctx.save();ctx.globalCompositeOperation='lighter';
+  ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,sz*5.2,0,TAU);ctx.fill();
+  ctx.restore();
+  /* 纸壳：上下略收的鼓形 */
+  ctx.beginPath();
+  ctx.moveTo(x-w*.5,y+h*.35);
+  ctx.bezierCurveTo(x-w*.62,y-h*.15,x-w*.34,y-h*.58,x,y-h*.62);
+  ctx.bezierCurveTo(x+w*.34,y-h*.58,x+w*.62,y-h*.15,x+w*.5,y+h*.35);
+  ctx.bezierCurveTo(x+w*.26,y+h*.57,x-w*.26,y+h*.57,x-w*.5,y+h*.35);
+  ctx.closePath();
+  const pg=ctx.createRadialGradient(x-w*.12,y+h*.06,sz*.05,x,y,sz*.95);
+  pg.addColorStop(0,'rgba(255,252,240,'+(0.99*a).toFixed(3)+')');
+  pg.addColorStop(0.55,'rgba(250,222,170,'+(0.95*a).toFixed(3)+')');
+  pg.addColorStop(1,'rgba(228,180,118,'+(0.90*a).toFixed(3)+')');
+  ctx.fillStyle=pg;ctx.fill();
+  /* 竖骨：暖褐，不发光 */
+  ctx.strokeStyle='rgba(146,96,52,'+(0.42*a).toFixed(3)+')';ctx.lineWidth=Math.max(0.02,w*0.022);
+  for(let k=-2;k<=2;k++){
+    const u=k/2.6;
+    ctx.beginPath();ctx.moveTo(x+u*w*.46,y-h*.55);
+    ctx.quadraticCurveTo(x+u*w*.60,y,x+u*w*.46,y+h*.52);ctx.stroke();
+  }
+  /* 上下口 */
+  ctx.fillStyle='rgba(72,48,30,'+(0.85*a).toFixed(3)+')';
+  ctx.fillRect(x-w*.34,y-h*.70,w*.68,h*.11);ctx.fillRect(x-w*.32,y+h*.44,w*.64,h*.09);
+  /* 芯火：纸内最白的一点（全片最亮点在灯上，不在月亮上） */
+  const fw=w*0.13*(0.8+0.4*fl),fh=h*0.20*(0.75+0.5*fl);
+  ctx.fillStyle='rgba(255,250,230,'+(0.96*a).toFixed(3)+')';
+  ctx.beginPath();ctx.ellipse(x,y+h*0.02,fw,fh,0,0,TAU);ctx.fill();
+  ctx.fillStyle='rgba(255,255,253,'+(0.95*a).toFixed(3)+')';
+  ctx.beginPath();ctx.ellipse(x,y+h*0.02,fw*0.45,fh*0.5,0,0,TAU);ctx.fill();
+}
+
+/* ---------------- 提灯人（无面部：背影/侧影，靠轮廓与灯读） ---------------- */
+function figureDraw(i,t,wind,sec){
+  layer(1);
+  const fx=figXAt(t);
+  const beat=FEAT.sig?beatIdx(t):9;
+  /* 步态：拍点上换步（每拍半步）；网格不可信则退回收缩量积分——两条都来自数据 */
+  const ph=FEAT.sig&&FEAT.beats.length
+    ? Math.PI*(function(){let n=0;for(const b of FEAT.beats){if(b<=t)n++;else break;}return n;})()
+    : TAU*2.0*(FEAT.cum[fi(t)]||0)/80;
+  const sw=Math.sin(ph),sw2=Math.sin(ph+Math.PI);
+  const bob=Math.abs(Math.cos(ph))*0.16;
+  const sc=CAM.scale;
+  const body='#04060b';
+  const rimA=0.26+0.24*at(FEAT.crv.rms,i);
+  ctx.save();ctx.translate(fx,0);
+  /* 尺度三件套（远景靠它们读"一个人提着灯"，不是靠整体提亮）：
+     灯下光池 / 脚下投影 / 身后冷辉。光池给出灯的照地半径，投影给出人的站姿。 */
+  const rmsI=at(FEAT.crv.rms,i);
+  ctx.save();ctx.globalCompositeOperation='lighter';
+  const pool=ctx.createRadialGradient(5.3,0.30,0.15,5.3,0.30,8.2);
+  pool.addColorStop(0,'rgba(255,198,128,'+(0.11+0.09*rmsI).toFixed(3)+')');
+  pool.addColorStop(0.5,'rgba(255,170,96,'+(0.045+0.035*rmsI).toFixed(3)+')');
+  pool.addColorStop(1,'rgba(255,150,70,0)');
+  ctx.fillStyle=pool;ctx.beginPath();ctx.ellipse(5.3,0.30,8.2,2.05,0,0,TAU);ctx.fill();
+  const halo=ctx.createRadialGradient(0.4,13.0,0.5,0.4,13.0,5.6);
+  halo.addColorStop(0,'rgba(172,198,232,'+(0.09+0.07*rmsI).toFixed(3)+')');
+  halo.addColorStop(1,'rgba(172,198,232,0)');
+  ctx.fillStyle=halo;ctx.beginPath();ctx.arc(0.4,13.0,5.6,0,TAU);ctx.fill();
+  ctx.restore();
+  const sh=ctx.createRadialGradient(-1.8,0.10,0.2,-1.8,0.10,6.4);
+  sh.addColorStop(0,'rgba(2,4,9,0.60)');sh.addColorStop(1,'rgba(2,4,9,0)');
+  ctx.fillStyle=sh;ctx.beginPath();ctx.ellipse(-1.8,0.10,6.4,0.95,0,0,TAU);ctx.fill();
+  /* 身体形状：定义一次，画三遍（冷边光 → 暖边光 → 黑身）。
+     边光靠"平移复制 + 压黑身"，只在朝向光源的那条边露 1.5 屏幕像素；
+     以前用 stroke 描边，线会落进剪影内部，远景里读成一条划过斗篷的划痕。 */
+  const hemLift=0.55+0.9*wind;
+  const bodyShapes=()=>{
+    for(const s0 of [sw,sw2]){
+      const hip=8.4,foot=0.15+s0*0.15,knee=4.2+s0*0.25;
+      ctx.beginPath();
+      ctx.moveTo(-0.55+0.15*s0,hip);
+      ctx.quadraticCurveTo(0.05+s0*0.42,knee,0.28+s0*0.95,foot);
+      ctx.lineTo(1.05+s0*0.95,foot+0.05);
+      ctx.quadraticCurveTo(0.85+s0*0.42,knee+0.3,0.35+0.15*s0,hip);
+      ctx.closePath();ctx.fill();
+    }
+    /* 大衣/斗篷：下摆被风掀起一点（wind 来自低频组能量） */
+    ctx.beginPath();
+    ctx.moveTo(-2.55,14.1);
+    ctx.bezierCurveTo(-3.4,11.4,-3.7,6.2,-4.4-0.5*hemLift,1.15+bob*0.2);
+    ctx.bezierCurveTo(-2.0,1.95-0.25*hemLift,0.6,2.2,0.9,1.25);
+    ctx.bezierCurveTo(2.1,2.0,3.35,2.1,4.15,1.2-bob*0.15);
+    ctx.bezierCurveTo(3.45,5.6,3.15,10.6,2.65,14.2);
+    ctx.closePath();ctx.fill();
+    /* 肩/颈/头 */
+    ctx.beginPath();ctx.ellipse(0.35,15.0,2.45,1.45,0,0,TAU);ctx.fill();
+    ctx.fillRect(-0.15,14.3,1.75,1.4);
+    ctx.beginPath();ctx.arc(0.85,16.32,1.5,0,TAU);ctx.fill();
+    /* 围巾：短，垂在胸前，末端随低频风摆 */
+    ctx.beginPath();ctx.moveTo(0.25,14.55);
+    ctx.quadraticCurveTo(-1.05-0.5*wind,14.0+0.3*Math.sin(t*2.1),-1.75-1.25*wind,12.65+0.55*Math.sin(t*1.7));
+    ctx.lineTo(-0.95-1.05*wind,12.15+0.5*Math.sin(t*1.7));
+    ctx.quadraticCurveTo(-0.15,13.35,0.75,13.75);ctx.closePath();ctx.fill();
+    /* 持灯手臂：举到胸前（灯不再拖到膝盖，近景里能与头同框而不切灯） */
+    ctx.beginPath();ctx.moveTo(2.35,13.9);
+    ctx.quadraticCurveTo(4.35,13.1,5.5,10.95);
+    ctx.lineTo(4.55,10.45);ctx.quadraticCurveTo(3.5,12.2,1.75,12.5);ctx.closePath();ctx.fill();
+    /* 拳头 */
+    ctx.beginPath();ctx.arc(5.15,10.65,0.64,0,TAU);ctx.fill();
+  };
+  const rx=1.5/sc;
+  ctx.fillStyle='rgba(200,220,248,'+rimA.toFixed(3)+')';
+  ctx.save();ctx.translate(-rx,-rx*0.45);bodyShapes();ctx.restore();
+  ctx.fillStyle='rgba(255,206,150,'+(0.10+0.16*at(FEAT.crv.onset,i)).toFixed(3)+')';
+  ctx.save();ctx.translate(rx*0.9,-rx*0.3);bodyShapes();ctx.restore();
+  ctx.fillStyle=body;bodyShapes();
+  /* 灯：攥在拳下（短钩，不是长线），摆幅跟拍点（事件驱动的衰减摆） */
+  const lsw=0.15*Math.sin(ph*2+0.7)+0.05*Math.sin(t*2.3);
+  const lx=5.15+lsw*1.0, ly=6.25;
+  ctx.strokeStyle='rgba(96,88,78,0.78)';ctx.lineWidth=0.07;
+  ctx.beginPath();ctx.moveTo(5.15,10.6);ctx.lineTo(lx,10.30);ctx.stroke();
+  lanternDraw(lx,ly,FIG_LANT,t,7,0.96);
+  ctx.restore();
+  return {x:fx,lx:fx+5.15,ly:6.25,bob};
+}
+
+/* ---------------- 前景草（视差 1.7，屏幕底缘）
+   近景/特写时若仍按世界尺度画，一根草会变成横贯画面的黑杠——
+   所以 scale>13 时换成"镜头前的虚焦暗部"，保住三层视差又不毁构图。 ---------------- */
+function grassDraw(i,t,wind,sec){
+  if(CAM.scale>13){foregroundScreen(i,t,wind);return;}
+  layer(1.7);
+  ctx.strokeStyle='rgba(2,4,8,0.98)';ctx.lineCap='round';
+  for(let k=0;k<150;k++){
+    const x=-260+hash(k*2.7)*520;
+    const h=3.2+hash(k*6.1)*8.5;
+    const lean=(hash(k*4.3)-0.5)*0.9+wind*1.5*Math.sin(t*0.8+k);
+    ctx.lineWidth=Math.max(0.05,0.12+0.1*hash(k*3.9));
+    ctx.beginPath();ctx.moveTo(x,0);
+    ctx.quadraticCurveTo(x+lean*h*0.35,h*0.55,x+lean*h,h);
+    ctx.stroke();
+  }
+  for(let k=0;k<16;k++){ /* 几丛高草，给前景一个明确的剪影 */
+    const x=-200+hash(k*8.1)*400,h=14+hash(k*3.3)*13;
+    ctx.lineWidth=0.28;
+    for(let j=0;j<5;j++){
+      const lean=(hash(k*5.1+j)-0.5)*1.6+wind*2.2*Math.sin(t*0.7+k+j*.4);
+      ctx.beginPath();ctx.moveTo(x+j*0.5,0);
+      ctx.quadraticCurveTo(x+lean*h*0.3,h*0.6,x+lean*h+j*0.7,h*(0.7+0.3*hash(k*7.1+j)));ctx.stroke();
+    }
+  }
+}
+function foregroundScreen(i,t,wind){
+  resetT();
+  /* 底部一层虚焦暗部：把主体压在中景（三层里"最近"的那层） */
+  const g=ctx.createLinearGradient(0,H*0.88,0,H);
+  g.addColorStop(0,'rgba(2,4,8,0)');g.addColorStop(1,'rgba(2,4,8,0.62)');
+  ctx.fillStyle=g;ctx.fillRect(0,H*0.88,W,H*0.12);
+  for(let k=0;k<4;k++){
+    const right=k%2===0;
+    const bx=right?W*(0.86+0.10*hash(k*7.7)):W*(0.02+0.10*hash(k*7.7));
+    const r=H*(0.20+0.16*hash(k*3.3));
+    const gg=ctx.createRadialGradient(bx,H*1.02,1,bx,H*1.02,r);
+    gg.addColorStop(0,'rgba(3,5,10,0.96)');
+    gg.addColorStop(0.6,'rgba(3,5,10,0.55)');
+    gg.addColorStop(1,'rgba(3,5,10,0)');
+    ctx.fillStyle=gg;ctx.beginPath();ctx.arc(bx,H*1.02,r,0,TAU);ctx.fill();
+  }
+}
+
+/* ---------------- 景深 / 尘 / 颗粒 / 暗角 ---------------- */
+const bokeh=(seed)=>{
+  resetT();
+  for(let k=0;k<16;k++){
+    const x=W*(0.05+0.9*hash(seed+k*3.7)),y=H*(0.08+0.84*hash(seed+k*9.1));
+    const r=(0.02+0.10*hash(seed+k*5.3))*Math.min(W,H);
+    const warm=hash(seed+k*2.1)<0.6;
+    const g=ctx.createRadialGradient(x,y,r*0.1,x,y,r);
+    g.addColorStop(0,warm?'rgba(255,200,140,0.10)':'rgba(170,195,225,0.07)');
+    g.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,r,0,TAU);ctx.fill();
+  }
+};
+function dustDraw(i,t){
+  resetT();
+  for(let k=0;k<46;k++){
+    const x=((hash(k*3.3)*W+t*(3+hash(k)*7)*DPR)%W+W)%W;
+    const y=((hash(k*7.9)*H+t*(5+hash(k)*9)*DPR)%H+H)%H;
+    const a=0.05+0.10*hash(k*5.1);
+    ctx.fillStyle='rgba(226,232,242,'+a.toFixed(3)+')';
+    ctx.fillRect(x,y,Math.max(1,DPR),Math.max(1,DPR));
+  }
+}
+let grainCv=null;
+function buildGrain(){
+  grainCv=document.createElement('canvas');grainCv.width=256;grainCv.height=256;
+  const g=grainCv.getContext('2d'),im=g.createImageData(256,256);
+  for(let k=0;k<256*256;k++){
+    const v=hash(k*1.7)*255;
+    im.data[k*4]=v;im.data[k*4+1]=v;im.data[k*4+2]=v;im.data[k*4+3]=255;
+  }
+  g.putImageData(im,0,0);
+}
+function grainDraw(i){
+  resetT();
+  if(!grainCv)return;
+  const ox=Math.floor(hash(i*1.13)*256),oy=Math.floor(hash(i*2.71)*256);
+  ctx.save();ctx.globalAlpha=0.055;
+  ctx.translate(-ox,-oy);
+  ctx.fillStyle=ctx.createPattern(grainCv,'repeat');
+  ctx.fillRect(0,0,W+256,H+256);
+  ctx.restore();
+}
+function vignetteDraw(){
+  resetT();
+  const g=ctx.createRadialGradient(W*0.5,H*0.48,H*0.30,W*0.5,H*0.5,H*0.95);
+  g.addColorStop(0,'rgba(0,0,0,0)');g.addColorStop(1,'rgba(0,0,0,0.55)');
+  ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+}
+
+/* ============================================================================
+   电影后期层（从 _v1-带后期 合流；场景仍是本片的分镜，不搬旧镜头表）
+   · 分离调色：暗部 +青 -红、亮部 +暖 -蓝；只对 luma 分区生效，不动中性灰
+   · halation：亮部阈值 0.76 的 bright-pass，两段模糊后以暖橙叠回。
+     上限压法（修 t≈127s 灯笼糊成白团）：
+       ① 叠加量乘以"余量" head=1-c —— halation 只能往暗处溢，永远不能把纸壳推到死白
+       ② 大面积高光（宽模糊也亮）衰减 areaW —— 近景灯笼纸壳是一大片亮面，不吃 halation；
+          只有小灯/月牙/字这类"点状高光"才有完整溢出
+       ③ 灯占画幅越大，uHalAmt 越低（JS 侧按 lanternCoverage 压）
+   · 颗粒：hash(帧号) 双层混合，暗部更粗；帧号 = floor(t*fps)，不是墙钟
+   · 径向色差 + 暗角 + 轻微 S 曲线 + 黑位托底（最后一律 max(c,0.008)，p1 必 >0）
+   · 主体锐度：合成前做 5 点 unsharp（0.34），抵消 halation 与色差对边缘的软化
+   场景画在 2D 离屏画布，合成在 WebGL；两者都是 f(数据, 帧号)。
+   ========================================================================== */
+const POST=(function(){
+  const gl=cv.getContext('webgl',{antialias:false,alpha:false,preserveDrawingBuffer:true,depth:false,stencil:false});
+  if(!gl)return {ok:false};
+  const VS='attribute vec2 aPos;varying vec2 vUv;void main(){vUv=aPos*0.5+0.5;gl_Position=vec4(aPos,0.0,1.0);}';
+  const FS_BRIGHT='precision highp float;varying vec2 vUv;uniform sampler2D uTex;uniform float uThr;'+
+    'void main(){vec3 c=texture2D(uTex,vUv).rgb;float l=dot(c,vec3(0.2126,0.7152,0.0722));'+
+    'float w=smoothstep(uThr,uThr+0.15,l);gl_FragColor=vec4(c*w,1.0);}';
+  const FS_BLUR='precision highp float;varying vec2 vUv;uniform sampler2D uTex;uniform vec2 uTexel;uniform vec2 uDir;uniform float uRad;'+
+    'void main(){vec2 d=uTexel*uDir*uRad;vec4 s=texture2D(uTex,vUv)*0.227;'+
+    's+=0.194*(texture2D(uTex,vUv+d)+texture2D(uTex,vUv-d));'+
+    's+=0.121*(texture2D(uTex,vUv+2.0*d)+texture2D(uTex,vUv-2.0*d));'+
+    's+=0.054*(texture2D(uTex,vUv+3.0*d)+texture2D(uTex,vUv-3.0*d));'+
+    's+=0.016*(texture2D(uTex,vUv+4.0*d)+texture2D(uTex,vUv-4.0*d));gl_FragColor=s;}';
+  const FS_COMP='precision highp float;varying vec2 vUv;'+
+    'uniform sampler2D uScene;uniform sampler2D uHal;uniform sampler2D uGlow;'+
+    'uniform vec2 uRes;uniform float uFrame,uHalAmt,uGlowAmt,uCA,uGrain,uVig,uLift,uSplit,uHit,uPost;'+
+    'float hash21(vec2 p){vec3 q=fract(vec3(p.xyx)*0.1031);q+=dot(q,q.yzx+33.33);return fract((q.x+q.y)*q.z);}'+
+    'void main(){'+
+    'vec2 d=vUv-0.5;float r2=dot(d,d);float k=uCA*uPost*(0.22+1.55*r2);'+
+    'vec3 c;c.r=texture2D(uScene,vUv+d*k).r;c.g=texture2D(uScene,vUv).g;c.b=texture2D(uScene,vUv-d*k).b;'+
+    'vec3 base=c;'+
+    'vec2 px=1.0/uRes;'+
+    'vec3 bl=(texture2D(uScene,vUv+vec2(px.x,0.0)).rgb+texture2D(uScene,vUv-vec2(px.x,0.0)).rgb'+
+    ' +texture2D(uScene,vUv+vec2(0.0,px.y)).rgb+texture2D(uScene,vUv-vec2(0.0,px.y)).rgb)*0.25;'+
+    'c+=(c-bl)*0.34;'+
+    'vec3 head=clamp(1.0-c,0.0,1.0);head=head*head;'+   /* 余量平方：只往暗处溢，亮面里几乎不再加 */
+    'vec3 hal=texture2D(uHal,vUv).rgb;'+
+    'vec3 glow=texture2D(uGlow,vUv).rgb;'+
+    'float glL=dot(glow,vec3(0.2126,0.7152,0.0722));'+
+    'float areaW=1.0-0.88*smoothstep(0.18,0.50,glL);'+     /* 大面积亮面：关掉大部分 halation */
+    'c+=hal*vec3(1.0,0.56,0.30)*uHalAmt*head*areaW;'+
+    'c+=glow*vec3(1.0,0.82,0.62)*uGlowAmt*head*(0.35+0.65*areaW);'+
+    'float l=dot(c,vec3(0.2126,0.7152,0.0722));'+
+    'float sh=1.0-smoothstep(0.02,0.36,l);float hi=smoothstep(0.40,0.92,l);'+
+    'c+=vec3(-0.007,0.004,0.015)*sh*uSplit;'+
+    'c*=mix(vec3(1.0),vec3(1.048,1.006,0.944),hi*0.45*uSplit);'+
+    'c*=1.0+0.18*uHit;c=(c-0.04)*(1.0+0.16*uHit)+0.04;'+
+    'vec3 cc=clamp(c,0.0,1.0);c=mix(c,cc*cc*(3.0-2.0*cc),0.15);'+
+    /* 黑位托底只在暗部做：亮部（灯纸/月）不再被抬，避免"后期自己把纸壳推白" */
+    'float floorW=1.0-smoothstep(0.62,0.96,l);'+
+    'c+=vec3(uLift*0.86,uLift*1.0,uLift*1.18)*floorW;'+
+    'float v=smoothstep(0.34,1.04,length(d)*1.30);c*=1.0-uVig*v;'+
+    'float g1=hash21(vUv*uRes+vec2(uFrame*11.31,uFrame*5.77));'+
+    'float g2=hash21(floor(vUv*uRes*0.5)+vec2(uFrame*3.17,uFrame*1.73));'+
+    'float gr=mix(g1,g2,0.42)-0.5;c+=gr*uGrain*(0.20+1.00*sh);'+
+    'c=max(c,vec3(0.008));c=mix(base,c,uPost);'+
+    'gl_FragColor=vec4(clamp(c,0.0,1.0),1.0);}';
+  let prog={},quad=null,sceneTex=null,T={},VW=1,VH=1;
+  function compile(t,src){const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(s));return s;}
+  function makeProgram(fs){
+    const p=gl.createProgram();
+    gl.attachShader(p,compile(gl.VERTEX_SHADER,VS));
+    gl.attachShader(p,compile(gl.FRAGMENT_SHADER,fs));
+    gl.bindAttribLocation(p,0,'aPos');gl.linkProgram(p);
+    if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(p));
+    const u={},n=gl.getProgramParameter(p,gl.ACTIVE_UNIFORMS);
+    for(let i=0;i<n;i++){const info=gl.getActiveUniform(p,i);u[info.name]=gl.getUniformLocation(p,info.name);}
+    return {p,u};
+  }
+  function mkTarget(w,h){
+    const tx=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tx);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    const fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tx,0);
+    return {tx,fb,w,h};
+  }
+  function mkTex(){
+    const tx=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tx);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    return tx;
+  }
+  function use(P){if(use.cur!==P){gl.useProgram(P.p);use.cur=P;}}
+  function bind(unit,tx,loc){gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,tx);gl.uniform1i(loc,unit);}
+  function resize(w,h){
+    if(w===VW&&h===VH&&prog.comp)return;
+    VW=w;VH=h;
+    prog.bright=makeProgram(FS_BRIGHT);prog.blur=makeProgram(FS_BLUR);prog.comp=makeProgram(FS_COMP);
+    quad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,quad);
+    gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+    sceneTex=mkTex();
+    const hw=Math.max(8,w>>1),hh=Math.max(8,h>>1);
+    T.a=mkTarget(hw,hh);T.b=mkTarget(hw,hh);T.hal=mkTarget(hw,hh);T.glow=mkTarget(hw,hh);
+    T.w=hw;T.h=hh;
+  }
+  function blurPass(src,dst,dx,dy,rad){
+    gl.bindFramebuffer(gl.FRAMEBUFFER,dst.fb);gl.viewport(0,0,dst.w,dst.h);
+    use(prog.blur);bind(0,src.tx,prog.blur.u.uTex);
+    gl.uniform2f(prog.blur.u.uTexel,1/src.w,1/src.h);
+    gl.uniform2f(prog.blur.u.uDir,dx,dy);gl.uniform1f(prog.blur.u.uRad,rad);
+    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+  }
+  function render(src,frame,pp,on){
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+    gl.bindTexture(gl.TEXTURE_2D,sceneTex);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,src);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,T.a.fb);gl.viewport(0,0,T.a.w,T.a.h);
+    use(prog.bright);bind(0,sceneTex,prog.bright.u.uTex);gl.uniform1f(prog.bright.u.uThr,0.76);
+    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+    blurPass(T.a,T.b,1,0,3.4);blurPass(T.b,T.hal,0,1,3.4);
+    blurPass(T.hal,T.b,1,0,15.0);blurPass(T.b,T.glow,0,1,15.0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,VW,VH);
+    use(prog.comp);
+    bind(0,sceneTex,prog.comp.u.uScene);bind(1,T.hal.tx,prog.comp.u.uHal);bind(2,T.glow.tx,prog.comp.u.uGlow);
+    gl.uniform2f(prog.comp.u.uRes,VW,VH);
+    gl.uniform1f(prog.comp.u.uFrame,frame);
+    gl.uniform1f(prog.comp.u.uGlowAmt,on?pp.glow:0);
+    gl.uniform1f(prog.comp.u.uHalAmt,on?pp.hal:0);
+    gl.uniform1f(prog.comp.u.uCA,on?pp.ca:0);
+    gl.uniform1f(prog.comp.u.uGrain,on?pp.grain:0);
+    gl.uniform1f(prog.comp.u.uVig,on?pp.vig:0);
+    gl.uniform1f(prog.comp.u.uLift,on?pp.lift:0);
+    gl.uniform1f(prog.comp.u.uSplit,on?pp.split:0);
+    gl.uniform1f(prog.comp.u.uHit,on?pp.hit:0);
+    gl.uniform1f(prog.comp.u.uPost,on?1:0);
+    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+  }
+  return {ok:true,resize,render};
+})();
+let POST_ON=true, FB2D=null;
+function postResize(w,h){ if(POST.ok)POST.resize(w,h); }
+/* 后期强度：全部是数据与帧的函数。cov = 灯占画幅（0..1），近景灯笼压 halation。 */
+function postParams(i,rmsv,onsv,secE,cov,accV){
+  const c=clamp(cov||0,0,1), protect=1/(1+9.0*c);
+  return {hal:(0.060+0.130*rmsv)*protect,
+    glow:(0.030+0.075*rmsv+0.025*secE)*protect,
+    ca:0.00042+0.00095*onsv,
+    grain:0.004+0.028*rmsv+0.034*secE,   /* 静音不等于无颗粒，但底噪降到 0.004：死数据下不许靠颗粒冒充在动 */
+    vig:0.40,lift:0.0125,split:0.85,
+    hit:clamp(accV*0.55,0,0.6)};
+}
+function postRender(frame,pp){
+  if(POST.ok){POST.render(sceneC,frame,pp,POST_ON);return;}
+  /* 兜底：没有 WebGL 时直接上屏，不假装做过调色（HUD 会写明"后期不可用"） */
+  if(!FB2D)FB2D=cv.getContext('2d');
+  if(!FB2D)return;
+  FB2D.setTransform(1,0,0,1,0,0);FB2D.drawImage(sceneC,0,0);
+}
+
+/* ---------------- 歌词 / 降级说明（画布文字都走账本） ---------------- */
+function lyricShow(s){
+  return String(s||'').replace(/[\u3040-\u30ff\u4e00-\u9fff][A-Za-z\u00c0-\u024f]+/g,m=>m.charAt(0))
+    .replace(/([\u3040-\u30ff\u4e00-\u9fff]) (?=[\u3040-\u30ff\u4e00-\u9fff])/g,'$1').trim();
+}
+function curLyric(t){
+  for(const l of FEAT.lyr)if(t>=+l.t0&&t<+(l.t1||(+l.t0+4)))return lyricShow(l.text);
+  return '';
+}
+function textDraw(t,shot){
+  resetT();
+  const lyr=curLyric(t);
+  if(lyr){
+    const maxW=W*0.80,base=Math.round(H*0.845);
+    let size=Math.round(Math.max(20,H*0.036)),lines=[lyr];
+    ctx.font='400 '+size+'px "Songti SC",SimSun,serif';
+    const wid=()=>Math.max.apply(null,lines.map(s=>ctx.measureText(s).width));
+    if(wid()>maxW){
+      /* 先缩到 78%，仍超宽就断两行（绝不截断加省略号） */
+      size=Math.round(size*0.78);ctx.font='400 '+size+'px "Songti SC",SimSun,serif';
+      if(wid()>maxW){
+        const mid=Math.ceil(lyr.length/2);
+        let cut=mid;
+        for(let k=Math.min(lyr.length-1,mid+4);k>Math.max(0,mid-4);k--)
+          if(lyr[k]===' ') {cut=k;break;}
+        lines=[lyr.slice(0,cut),lyr.slice(cut).trim()];
+        while(size>16&&wid()>maxW){size-=1;ctx.font='400 '+size+'px "Songti SC",SimSun,serif';}
+      }
+    }
+    ctx.textAlign='center';ctx.textBaseline='alphabetic';
+    ctx.save();ctx.shadowColor='rgba(0,0,0,.9)';ctx.shadowBlur=16*DPR;
+    const lh=Math.round(size*1.30),y0=base-(lines.length-1)*lh;
+    ctx.fillStyle='rgba(238,243,250,0.94)';
+    for(let k=0;k<lines.length;k++){
+      ctx.font='400 '+size+'px "Songti SC",SimSun,serif';
+      const w=ctx.measureText(lines[k]).width;
+      LG.note(W/2,y0+k*lh,w,lines[k],size,'center');
+      ctx.fillText(lines[k],W/2,y0+k*lh);
+    }
+    ctx.restore();
+  }
+  /* 诚实降级：不用默认值冒充；写在左下角，字号 15，不与歌词争位 */
+  const msgs=[];
+  if(FEAT.secMode==='none')msgs.push('无分段数据 → 单镜头到底（不凭空切）');
+  else if(FEAT.allFlat)msgs.push('段能量全零 → 单镜头（不凭空切）');
+  if(!FEAT.sig)msgs.push('拍网格不可信 → 切点不吸附拍点，卡点脉冲停用');
+  if(!FEAT.bands)msgs.push('频段包络未提供 → 剪影起伏改用响度');
+  if(msgs.length){
+    const size=Math.round(Math.max(14,H*0.0165));
+    ctx.font=size+'px ui-monospace,Consolas,monospace';ctx.textAlign='left';ctx.textBaseline='alphabetic';
+    let y=H-Math.round(H*0.028);
+    for(let k=msgs.length-1;k>=0;k--){
+      const w=ctx.measureText(msgs[k]).width;
+      LG.note(W*0.045,y,w,msgs[k],size,'left');
+      ctx.fillStyle=C.amber;ctx.fillText(msgs[k],W*0.045,y);
+      y-=Math.round(size*1.45);
+    }
+  }
+  /* 场记板：每帧可见的分镜标记（画布文字账本的常驻行，不与歌词争位） */
+  {
+    const size=Math.max(13,Math.round(H*0.0145));
+    const txt='S'+String(shot.i+1).padStart(2,'0')+' · '+shot.tpl.size+' · '+shot.tpl.move;
+    ctx.font=size+'px ui-monospace,Consolas,monospace';ctx.textAlign='right';ctx.textBaseline='middle';
+    const w=ctx.measureText(txt).width,x=W*0.955,y=H-Math.round(H*0.085);
+    LG.note(x,y,w,txt,size,'right');
+    ctx.fillStyle='rgba(214,224,238,0.42)';
+    ctx.fillText(txt,x,y);
+  }
+  ctx.textAlign='left';ctx.textBaseline='alphabetic';
+}
+
+/* ---------------- 主绘制 ---------------- */
+function drawScene(t,i,shot,cam,pal,opts){
+  const F=FEAT;
+  const rms=at(F.crv.rms,i),on=at(F.crv.onset,i);
+  const sec=secOf(shot?shot.sec:secAt(t));
+  CAM=cam;
+  resetT();ctx.fillStyle=C.bg;ctx.fillRect(0,0,W,H);
+  skyDraw(pal,i,rms);
+  starsDraw(i,t,pal,sec);
+  moonDraw(i,t,pal,rms);
+  cloudsDraw(i,t,pal);
+  const high=at(F.high,i),low=at(F.low,i);
+  ridgesDraw(i,t,pal,rms,sec);
+  groundDraw(i,t,pal,sec);
+  const wind=0.55+1.5*low+0.6*high;
+  treeDraw(i,t,wind,pal,sec);
+  figureDraw(i,t,wind,sec);
+  grassDraw(i,t,wind,sec);
+  if(opts.bokeh)bokeh(i*3.1);
+  if(opts.dust)dustDraw(i,t);
+  resetT();
+}
+
+function draw(){
+  if(!FEAT||!FEAT.fr){drawWaiting();return;}
+  resetT();LG.reset();
+  const t=clamp(M.t,0,FEAT.dur),i=fi(t);
+  const rms=at(FEAT.crv.rms,i),on=sm(FEAT.crv.onset,i,3),onRaw=at(FEAT.crv.onset,i);
+  const shot=shotAt(t)||M.SHOTS[0];
+  SHOT_IDX=shot?shot.i:-1;SHOT_T0=shot?shot.t0:0;SHOT_T1=shot?shot.t1:1;
+  const sec=secOf(shot.sec);
+  const pal=paletteFor(sec,shot.sec);
+  /* 事件进画面：重音包络 + 响度呼吸都在镜头求值之前定好，全片各层共用 */
+  const ACC=accentAt(t);
+  LIGHT.acc=ACC.v;LIGHT.breath=clamp(rmsEnv(t)-0.5,-0.40,0.40);
+  /* 镜头基准相机 + 主体呼吸（rms 的连续量，±4.5%，绕焦点缩放，不是整帧抽搐） */
+  let cam=camOf(shot,t);
+  const breathe=1+0.045*sm(FEAT.crv.rms,i,4);
+  const B0=focusBoxAt(shot,t,cam);
+  const bx=(B0.x0+B0.x1)/2,by=(B0.y0+B0.y1)/2;
+  /* 快速形变（0.30s, 无淡黑）：相机从前一镜末位甩到本镜起始位 */
+  let morph=0,mFrom=null;
+  if(shot.nextTrans==='whip'&&shot.whipFrom){
+    const mw=0.30;
+    if(t<shot.t0+mw){morph=(t-shot.t0)/mw;mFrom=shot.whipFrom;}
+  }
+  if(morph>0&&mFrom){
+    const ca=camOf(mFrom,mFrom.t1),cb=camOf(shot,shot.t0);
+    const e=easeInOut(morph);
+    cam={cx:lerp(ca.cx,cb.cx,e),cy:lerp(ca.cy,cb.cy,e),scale:lerp(ca.scale,cb.scale,e)};
+  }
+  /* 手持微颤：幅度由 onset 决定，方向按帧号哈希（确定性） */
+  const shake=(0.0009+0.0022*onRaw)*cam.scale;
+  const sx=(hash(i*1.7)-0.5)*2*shake, sy=(hash(i*2.9)-0.5)*2*shake;
+  cam={cx:cam.cx+sx,cy:cam.cy+sy,scale:cam.scale*breathe,breathe,px:bx,py:by};
+  CAM=cam;
+  /* 停顿 2.6s 时把它当作"镜头还没进来"——不，形变只发生 0.30s，其余是硬切 */
+  if(morph>0&&mFrom){
+    for(let k=3;k>=1;k--){
+      const u=clamp(morph-k*0.085,0,1),e=easeInOut(u);
+      const ca=camOf(mFrom,mFrom.t1),cb=camOf(shot,shot.t0);
+      const c2={cx:lerp(ca.cx,cb.cx,e)+sx,cy:lerp(ca.cy,cb.cy,e)+sy,
+        scale:lerp(ca.scale,cb.scale,e)*breathe,breathe,px:bx,py:by};
+      ctx.save();ctx.globalAlpha=0.16+0.10*(3-k);
+      drawScene(t,i,shot,c2,pal,{bokeh:shot.tpl.focus==='lantern'||shot.tpl.focus==='lanternCore',dust:false});
+      ctx.restore();
+    }
+  }
+  drawScene(t,i,shot,cam,pal,{bokeh:shot.tpl.focus==='lantern'||shot.tpl.focus==='lanternCore',dust:true});
+  /* 重音：不是"闪 1 帧白"，而是整幅加色 + 0.2s 余晖（下拍更重、更长）。
+     峰值 alpha 0.10–0.14；全曲事件数在 hud 里可查，不频闪。 */
+  const isBeat=ACC.v>0.45,isDown=!!(ACC.down&&isBeat);
+  /* 有后期时暗角/颗粒在 WebGL 合成里做，不叠两遍；无 WebGL 才退回 2D 兜底 */
+  if(!POST.ok){vignetteDraw();grainDraw(i);}
+  if(ACC.alpha>0.004){
+    resetT();ctx.save();ctx.globalCompositeOperation='lighter';
+    ctx.fillStyle='rgba(255,204,152,'+ACC.alpha.toFixed(4)+')';ctx.fillRect(0,0,W,H);
+    ctx.restore();
+  }
+  /* 响度呼吸：极轻的整幅加色，跟着 ±0.33s 的响度包络（不是墙钟） */
+  if(LIGHT.breath>0.004){
+    resetT();ctx.save();ctx.globalCompositeOperation='lighter';
+    ctx.fillStyle='rgba(150,176,214,'+(0.030*LIGHT.breath).toFixed(4)+')';
+    ctx.fillRect(0,0,W,H);ctx.restore();
+  }
+  textDraw(t,shot);
+  /* 后期合成：这一步之后 cv 上才是最终像素（调色/halation/色差/暗角/颗粒/黑位） */
+  postRender(i,postParams(i,rms,onRaw,sec.energy,lanternCoverage(shot,t),ACC.v));
+  /* 状态面板 + 自证 */
+  const B=focusBoxAt(shot,t,cam);
+  const fa=Math.max(0,Math.min(W,B.x1)-Math.max(0,B.x0))*Math.max(0,Math.min(H,B.y1)-Math.max(0,B.y0))/(W*H);
+  const nextIdx=Math.min(shot.i+2,M.SHOTS.length);
+  el('hudNow').textContent='镜头 '+String(shot.i+1).padStart(2,'0')+' / '+M.SHOTS.length+
+    ' · '+shot.tpl.size+' · '+shot.tpl.move+' · 焦点：'+focusName(shot.tpl.focus);
+  el('hudShot').textContent='切点 '+clock(shot.t0)+' · '+(shot.nextTrans==='whip'?'0.30s 快速形变':'硬切（1 帧）')+
+    ' · 本段 '+nz(shot.t1-shot.t0,1)+'s · 后期 '+(POST.ok?(POST_ON?'开':'关'):'不可用');
+  syncBar(shot.i);
+  const nanHit=scanNaN();
+  window.__SELFTEST__={
+    device:'H1-分镜夜行',mode:'shots',
+    shot_count:M.SHOTS.length,cut_count:Math.max(0,M.SHOTS.length-1),
+    whip_count:M.SHOTS.filter(s=>s.nextTrans==='whip').length,
+    shot_index:shot.i+1,shot_name:shot.tpl.name,shot_size:shot.tpl.size,shot_move:shot.tpl.move,
+    focus:shot.tpl.focus,focus_area:+fa.toFixed(3),min_focus_area:+minFocusArea().toFixed(3),
+    lantern_pct:+(lanternCoverage(shot,t)*100).toFixed(1),
+    t:+t.toFixed(3),
+    label_collisions:LG.st.collisions,label_checked:LG.st.checked,label_drawn:LG.st.drawn,
+    label_ellipsis:LG.st.ellipsis,min_drawn_font_px:LG.st.checked?Math.round(LG.st.minfont*100)/100:11,
+    ledger_detect_synth:LEDGER_PROBE.detected,ledger_e2e_forced:LEDGER_PROBE.e2e,
+    ledger_selftest_ok:LEDGER_PROBE.ok,
+    grid_ok:FEAT.sig,sec_mode:FEAT.secMode,
+    accents:{n:FEAT.accN||0,env:+ACC.v.toFixed(3),alpha:+ACC.alpha.toFixed(3),down:!!ACC.down},
+    drive:{rms:+rms.toFixed(4),breathe:+breathe.toFixed(4),lantern:+lanternLevel(t,i).toFixed(4),
+      moon:+moonLevel(t,i).toFixed(4),beat_on:!!isBeat,down_on:!!isDown,
+      accent:+ACC.v.toFixed(4),light_breath:+LIGHT.breath.toFixed(4)},
+    nan_hits:nanHit,shot_slate:'镜头 '+(shot.i+1)+' / '+M.SHOTS.length+' · '+shot.tpl.size+' · '+shot.tpl.move,
+    post_ok:!!POST.ok,post_on:!!(POST.ok&&POST_ON),
+    post_hal:+postParams(i,rms,onRaw,sec.energy,lanternCoverage(shot,t),ACC.v).hal.toFixed(4),
+    lantern_cov:+lanternCoverage(shot,t).toFixed(3)
+  };
+}
+function focusName(f){
+  return {tree:'枯树',canopy:'树冠',root:'树根',branch:'挂灯枝',cluster:'枝上灯群',
+    moon:'月',figure:'提灯人',lantern:'提灯与手',lanternCore:'灯纸与芯火'}[f]||f;
+}
+function clock(s){const m=Math.floor(s/60),q=Math.floor(s%60);return m+':'+String(q).padStart(2,'0');}
+function lanternLevel(t,i){
+  const on=sm(FEAT.crv.onset,i,2);
+  return clamp(0.22+0.78*on+0.10*at(FEAT.crv.rms,i),0,1.2);
+}
+function moonLevel(t,i){return clamp(0.35+0.65*at(FEAT.crv.rms,i),0,1);}
+function scanNaN(){
+  let n=0;
+  for(const v of [M.t,M.dur,M.fr,M.fps])if(!Number.isFinite(v))n++;
+  for(const s of M.SHOTS)for(const v of [s.t0,s.t1,s.sec])if(!Number.isFinite(v))n++;
+  return n;
+}
+function drawWaiting(){
+  resetT();ctx.fillStyle=C.bg;ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#8d99aa';ctx.font=Math.round(H*0.026)+'px ui-monospace,Consolas,monospace';
+  ctx.textAlign='center';
+  ctx.fillText('等待数据：把 *.features.json 拖进来（音频可选，仅作走带与监听）',W/2,H/2);
+  ctx.textAlign='left';
+  postRender(0,{hal:0,glow:0,ca:0,grain:0,vig:0.36,lift:0.0125,split:0,hit:0});
+  window.__SELFTEST__={device:'H1-分镜夜行',waiting:true,nan_hits:0,post_gl:!!POST.ok};
+}
+
+/* ---------------- 走动 / 交互 ---------------- */
+function loop(ts){
+  requestAnimationFrame(loop);
+  if(!FEAT){draw();return;}
+  const dt=M.last?Math.min(0.05,(ts-M.last)/1000):0;M.last=ts;
+  if(audioEl&&!audioEl.paused){M.t=clamp(audioEl.currentTime,0,M.dur);M.playing=true;
+    if(M.t>=M.dur){M.playing=false;audioEl.pause();}}
+  else if(M.playing){M.t+=dt;if(M.t>=M.dur){M.t=M.dur;M.playing=false;}}
+  draw();
+}
+requestAnimationFrame(loop);
+let idleT=null;
+function wake(){
+  document.body.classList.remove('idle');clearTimeout(idleT);
+  idleT=setTimeout(()=>{if(FEAT)document.body.classList.add('idle');else wake();},3600);
+}
+for(const e of ['pointermove','pointerdown','keydown','wheel'])addEventListener(e,wake);
+wake();
+document.addEventListener('keydown',e=>{
+  if(e.code==='Space'){e.preventDefault();M.playing=!M.playing;M.last=0;
+    if(audioEl){if(M.playing)audioEl.play().catch(()=>{});else audioEl.pause();}}
+  if(e.key==='0'){M.t=0;M.playing=false;M.last=0;
+    if(audioEl){audioEl.pause();audioEl.currentTime=0;}draw();}
+  if(e.key==='h'||e.key==='H'){el('bar').classList.toggle('on');}
+});
+function takeAudioFile(file){
+  try{
+    if(audioEl){try{audioEl.pause();URL.revokeObjectURL(audioEl.src);}catch(_){}}
+    audioEl=new Audio(URL.createObjectURL(file));audioEl.preload='auto';
+    audioEl.onended=()=>{M.playing=false;};
+    M.t=0;M.last=0;
+    audioEl.play().then(()=>{M.playing=true;}).catch(()=>{toast('浏览器拦了自动播放：点一下画面或按空格继续');});
+    toast('音频已载入 · '+file.name);
+  }catch(e){toast('音频载入失败：'+String(e.message||e));}
+}
+function takeFeat(txt){try{loadFeatText(txt);draw();toast('数据已载入 · '+M.SHOTS.length+' 镜头');}
+  catch(err){toast('数据读不了：'+String(err.message||err));}}
+el('fpFeat').addEventListener('change',async e=>{const f=e.target.files[0];if(f)takeFeat(await f.text());});
+document.addEventListener('dragover',e=>{e.preventDefault();});
+document.addEventListener('drop',async e=>{e.preventDefault();
+  for(const f of e.dataTransfer.files)if(/\.json$/i.test(f.name))takeFeat(await f.text());});
+let toastT=null;
+function toast(s){const t=el('toast');t.textContent=s;t.style.opacity=1;clearTimeout(toastT);
+  toastT=setTimeout(()=>t.style.opacity=0,1800);}
+
+/* ---------------- 镜头表（H 键） ---------------- */
+function buildBar(){
+  const bar=el('bar');bar.textContent='';
+  for(const s of M.SHOTS){
+    const d=document.createElement('div');d.className='seg';d.dataset.i=s.i;
+    d.style.width=Math.max(66,Math.round((s.t1-s.t0)/M.dur*innerWidth*0.92))+'px';
+    d.innerHTML=String(s.i+1).padStart(2,'0')+' '+s.tpl.size+'<i>'+s.tpl.name+' · '+s.tpl.move+'</i>';
+    bar.appendChild(d);
+  }
+}
+function syncBar(i){
+  const bar=el('bar');if(!bar.classList.contains('on'))return;
+  for(const d of bar.children){
+    const on=+d.dataset.i===i;
+    if(on!==d.classList.contains('cur'))d.classList.toggle('cur',on);
+    if(on&&bar.scrollWidth>bar.clientWidth){
+      const L=d.offsetLeft,R=L+d.offsetWidth;
+      if(L<bar.scrollLeft||R>bar.scrollLeft+bar.clientWidth)bar.scrollLeft=Math.max(0,L-40);
+    }
+  }
+}
+
+/* ---------------- 标注台握手（只承诺 bundleState 里登记的事） ---------------- */
+const BUNDLE={received:false,ack_sent:false,project:null,bpm:null,bpm_source:null,human_bpm:false,
+  sec_mode:null,driven_bounds:[],shot_bounds:[],human_regions:[],sugg_regions:[],suggestion_bounds:[],
+  sketch_strokes:0,error:'',audio:''};
+window.__BUNDLE__=BUNDLE;
+function isHuman(r){return !!r&&(r.confirmed===true||r.auto===false);}
+function updateSrcLine(){
+  const s=el('srcLine');if(!s)return;
+  if(!BUNDLE.received){s.style.display='none';return;}
+  s.style.display='block';
+  s.textContent='来自标注台 · '+(BUNDLE.project||'未命名')+' · 拍速 '+
+    (Number.isFinite(BUNDLE.bpm)?BUNDLE.bpm.toFixed(1):'未提供')+'（'+(BUNDLE.bpm_source||'自动')+'）'+
+    (BUNDLE.sec_mode==='sections-fallback'?' · 按自动分段（未经人工确认）':'');
+}
+window.addEventListener('message',ev=>{
+  const d=ev&&ev.data;
+  if(d&&d.kind==='annotator-audio'){if(d.buf){try{takeAudioFile(new File([d.buf],d.name||'来自标注台',{type:d.type}));}catch(e){}}return;}
+  if(!d||d.kind!=='annotator-bundle')return;
+  try{
+    const pr=d.project||{};BUNDLE.project=pr.name||'未命名';BUNDLE.bpm=Number.isFinite(+pr.bpm)?+pr.bpm:null;
+    BUNDLE.bpm_source=pr.bpm_source||'自动';BUNDLE.human_bpm=/^人工/.test(String(BUNDLE.bpm_source));
+    loadFeatText(JSON.stringify(d.features||{}));
+    const regs=(d.regions||[]).filter(r=>r&&Number.isFinite(+r.t0)&&Number.isFinite(+r.t1));
+    const hum=regs.filter(isHuman),sug=regs.filter(r=>!isHuman(r));
+    BUNDLE.human_regions=hum.map(r=>[+r.t0,+r.t1]);BUNDLE.sugg_regions=sug.map(r=>[+r.t0,+r.t1]);
+    BUNDLE.suggestion_bounds=sug.map(r=>[+r.t0,+r.t1]);
+    if(hum.length){
+      BUNDLE.sec_mode='regions';
+      FEAT.secs=hum.map((r,k)=>{const a=+r.t0,b=+r.t1,i0=fi(a),i1=fi(b);
+        let e=0,n=0;for(let j=i0;j<=i1;j++){e+=at(FEAT.crv.rms,j);n++;}
+        return {start:a,end:b,energy:n?e/n:0,bright:.5,tension:.5,noise:.2,lowhigh:.5,onset_per_s:0,raw:null,i:k};});
+      buildShots();
+    }else{BUNDLE.sec_mode='sections-fallback';}
+    /* driven_bounds = 真正在驱动"段落级机构"的边界（人工段，或回退态的自动分段）；
+       镜头切点另记 shot_bounds —— 镜头是导演层的派生，不是段落真值。 */
+    BUNDLE.driven_bounds=((FEAT&&FEAT.secs)||[]).map(s=>[+s.start,+s.end]);
+    BUNDLE.shot_bounds=M.SHOTS.map(s=>[+s.t0.toFixed(2),+s.t1.toFixed(2)]);
+    BUNDLE.received=true;updateSrcLine();
+    if(ev.source)try{ev.source.postMessage({kind:'annotator-bundle-ack',device:'MV'},'*');BUNDLE.ack_sent=true;}catch(e){}
+  }catch(err){BUNDLE.error=String(err.message||err);}
+});
+
+/* ---------------- 离线出片 / 自检接口 ---------------- */
+window.__M={
+  injectFeatText(s){loadFeatText(s);draw();},
+  setTime(t){if(audioEl)audioEl.pause();M.playing=false;M.t=clamp(+t||0,0,FEAT?FEAT.dur:0);draw();},
+  state(){return {t:M.t,dur:M.dur,frames:M.fr,fps:M.fps,playing:M.playing,audio:!!audioEl};},
+  selftest(){return window.__SELFTEST__||null;},
+  shots(){return M.SHOTS.map(s=>({i:s.i+1,key:s.key,name:s.tpl.name,size:s.tpl.size,move:s.tpl.move,
+    focus:s.tpl.focus,sec:s.sec,start:+s.t0.toFixed(2),end:+s.t1.toFixed(2),
+    dur:+(s.t1-s.t0).toFixed(2),trans:s.nextTrans,
+    focus_area:+focusArea(s,(s.t0+s.t1)/2).toFixed(3),min_area:+Math.min(
+      focusArea(s,s.t0+(s.t1-s.t0)*0.02),focusArea(s,(s.t0+s.t1)/2),focusArea(s,s.t1-(s.t1-s.t0)*0.02)).toFixed(3)}));},
+  probe(t){
+    const tt=clamp(+t,0,FEAT?FEAT.dur:0),i=fi(tt);
+    const ac=accentAt(tt);
+    return {t:+tt.toFixed(3),rms:at(FEAT.crv.rms,i),onset:at(FEAT.crv.onset,i),
+      lantern:+lanternLevel(tt,i).toFixed(4),
+      breathe:+(1+0.045*sm(FEAT.crv.rms,i,4)).toFixed(4),
+      accent:+ac.v.toFixed(4),accent_alpha:+ac.alpha.toFixed(3),light_breath:+LIGHT.breath.toFixed(4),
+      lantern_pct:+(lanternCoverage(shotAt(tt),tt)*100).toFixed(1),
+      shot:(shotAt(tt)||{}).i+1||0};
+  },
+  accents(){
+    const A=(FEAT&&FEAT.acc)||[];
+    let mn=1,mx=0,dn=0;
+    for(const a of A){const al=0.100+0.025*a.s+(a.down?0.015:0);mn=Math.min(mn,al);mx=Math.max(mx,al);if(a.down)dn++;}
+    return {n:A.length,down:dn,alpha_min:A.length?+mn.toFixed(3):0,alpha_max:A.length?+mx.toFixed(3):0,
+      first:A.slice(0,5).map(a=>+a.t.toFixed(2))};
+  },
+  snap(w,h){w=w||160;h=h||90;const c2=document.createElement('canvas');c2.width=w;c2.height=h;
+    const g=c2.getContext('2d');g.fillStyle='#000';g.fillRect(0,0,w,h);g.drawImage(cv,0,0,w,h);
+    const d=g.getImageData(0,0,w,h).data,o=new Uint8Array(w*h);
+    for(let i=0,j=0;i<d.length;i+=4,j++)o[j]=(d[i]*77+d[i+1]*151+d[i+2]*28)>>8;return o.join(',');},
+  bundleState(){return window.__BUNDLE__;},
+  setPost(on){POST_ON=!!on;draw();return {ok:!!POST.ok,on:POST_ON};},
+  setChrome(on){
+    const d=on?'':'none';
+    el('hud').style.display=d;el('hint').style.display=d;el('drop').style.display=d;
+    el('toast').style.display=d;
+    if(!on){el('bar').classList.remove('on');el('bar').style.display='none';}
+    else el('bar').style.display='';
+  }
+};
+resize();
+draw();
+</script>
+</body>
+</html>

@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>数字艺术装置 · 课堂演示</title>
+<style>
+  :root{--bg:#070a0d;--ink:#dfe6ee;--dim:#8fa0b3;--faint:#5d6b7a;--line:#2b333c;--amber:#ffb24d;--warm:#ffd29a;--plate:#0b1015}
+  *{box-sizing:border-box}
+  html,body{margin:0;min-height:100%;background:var(--bg);color:var(--ink);
+    font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  body{padding:clamp(18px,3vw,44px) clamp(18px,4vw,64px) 36px;
+    background:
+      radial-gradient(900px 520px at 12% -8%, rgba(90,120,160,.10), transparent 60%),
+      radial-gradient(760px 480px at 100% 4%, rgba(255,178,77,.055), transparent 60%),
+      var(--bg)}
+  header{display:flex;justify-content:space-between;align-items:flex-end;gap:24px;
+    border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:clamp(18px,2.4vw,30px)}
+  h1{margin:0;font:600 clamp(22px,2.3vw,32px)/1.2 "Songti SC",SimSun,serif;letter-spacing:.06em}
+  h1 em{font-style:normal;color:var(--amber)}
+  .sub{color:var(--dim);font-size:clamp(12px,1vw,14px);margin-top:7px;line-height:1.6}
+  .meta{text-align:right;color:var(--faint);font:12px/1.7 ui-monospace,Consolas,monospace;white-space:nowrap}
+  .meta b{display:block;color:var(--dim);font-weight:400}
+  .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:clamp(12px,1.3vw,18px)}
+  @media (max-width:1080px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  @media (max-width:680px){.grid{grid-template-columns:1fr}header{flex-direction:column;align-items:flex-start}.meta{text-align:left}}
+  a.card{display:flex;flex-direction:column;min-height:clamp(150px,15vw,196px);padding:clamp(14px,1.5vw,20px);
+    background:linear-gradient(180deg,rgba(18,24,31,.92),rgba(11,16,21,.96));
+    border:1px solid var(--line);border-radius:6px;text-decoration:none;color:inherit;position:relative;
+    transition:border-color .18s,transform .18s,background .18s}
+  a.card:hover{border-color:#4a5665;transform:translateY(-2px);background:linear-gradient(180deg,rgba(22,29,38,.96),rgba(12,17,23,.98))}
+  a.card .idx{font:600 12px/1 ui-monospace,Consolas,monospace;color:var(--amber);letter-spacing:.14em}
+  a.card h2{margin:10px 0 6px;font:600 clamp(17px,1.5vw,21px)/1.3 "Songti SC",SimSun,serif;letter-spacing:.03em}
+  a.card p{margin:0;color:var(--dim);font-size:clamp(12px,1.02vw,13.5px);line-height:1.65}
+  a.card .go{margin-top:auto;padding-top:14px;color:var(--faint);font:12px/1 ui-monospace,Consolas,monospace;
+    display:flex;justify-content:space-between;align-items:center}
+  a.card:hover .go{color:var(--warm)}
+  a.card.anno{border-color:#3a3225;background:linear-gradient(180deg,rgba(28,24,17,.92),rgba(15,13,10,.96))}
+  a.card.anno .idx{color:var(--warm)}
+  a.card.anno:hover{border-color:#6b5734}
+  footer{margin-top:clamp(20px,2.6vw,34px);border-top:1px solid var(--line);padding-top:16px;
+    display:grid;grid-template-columns:1.15fr 1fr;gap:clamp(16px,3vw,48px)}
+  @media (max-width:860px){footer{grid-template-columns:1fr}}
+  footer h3{margin:0 0 7px;font:600 12px/1 ui-monospace,Consolas,monospace;letter-spacing:.12em;color:var(--dim)}
+  footer p{margin:0;color:var(--faint);font-size:12.5px;line-height:1.75}
+  footer b{color:var(--dim);font-weight:400}
+  .demo-line{display:flex;gap:10px;align-items:center;color:var(--faint);font:12px/1.6 ui-monospace,Consolas,monospace;margin-bottom:10px}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--amber);box-shadow:0 0 10px rgba(255,178,77,.6);flex:none}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>数字艺术装置 <em>·</em> 课堂演示</h1>
+    <div class="sub">五支由乐曲分析数据驱动的音乐影像 + 一台音轨标注台。纯前端、离线可开；画面里的每个运动都能指回一个字段。</div>
+  </div>
+  <div class="meta"><b>DEMO 096 BPM / 60s</b>自制音频 · 无版权素材</div>
+</header>
+
+<div class="demo-line"><span class="dot"></span>点卡片即用打包好的演示数据打开；若要放自己的歌，先进标注台载入音频。</div>
+
+<section class="grid">
+  <a class="card" href="player.html?p=a&demo=1">
+    <div class="idx">A / 频谱传动引擎</div>
+    <h2>把 96 条频带接成传动轴</h2>
+    <p>六组齿轮吃官方分组的频带能量；主飞轮转角是 Σbands 的积分，曲柄由低频帧差打拍。</p>
+    <div class="go"><span>打开演示</span><span>→</span></div>
+  </a>
+  <a class="card" href="player.html?p=b&demo=1">
+    <div class="idx">B / 擒纵调速钟</div>
+    <h2>每一拍推进 1/24 圈</h2>
+    <p>发条吃 onset 积分，擒纵轮按 beats 步进；拍网格不可信时脱开空转，不补 120 BPM。</p>
+    <div class="go"><span>打开演示</span><span>→</span></div>
+  </a>
+  <a class="card" href="player.html?p=c&demo=1">
+    <div class="idx">C / 地层档案压机</div>
+    <h2>响度推动纸带，段落压成沉积层</h2>
+    <p>纸带行程 = ∫响度；每个段落的读数压进一层岩芯。舞台占画幅 77%，读数压缩成窄带。</p>
+    <div class="go"><span>打开演示</span><span>→</span></div>
+  </a>
+  <a class="card" href="player.html?p=d&demo=1">
+    <div class="idx">D / 音符液压柱</div>
+    <h2>音符定柱高，滑音与颤音起波纹</h2>
+    <p>唯一吃 timeline 的一台：melody/bass 分柱，pitch_bend 拨指针；水槽舞台占画幅 78%。</p>
+    <div class="go"><span>打开演示</span><span>→</span></div>
+  </a>
+  <a class="card" href="player.html?p=mv&demo=1">
+    <div class="idx">MV / 分镜夜行</div>
+    <h2>按段落切镜的夜行短片</h2>
+    <p>一座枯树、一个提灯人、一轮月；按 structure.sections 切镜头，硬切或 0.30s 快速形变，WebGL 后期。</p>
+    <div class="go"><span>打开演示</span><span>→</span></div>
+  </a>
+  <a class="card anno" href="annotator.html">
+    <div class="idx">AN / 音轨标注台</div>
+    <h2>载入你的歌，划段，再送进装置</h2>
+    <p>浏览器内近似分析、拍速候选、人工区间与手绘笔迹；底部「送进装置」把数据和声音一起带过去。</p>
+    <div class="go"><span>打开标注台</span><span>→</span></div>
+  </a>
+</section>
+
+<footer>
+  <div>
+    <h3>演示数据</h3>
+    <p>这段 60s / 96 BPM 的曲子是<strong>用代码合成的</strong>（<code>tools/make_demo.py</code>），从同一份乐谱导出 D 的 timeline 真值。
+    分析器原读拍速 192（倍层级），按作曲真值人工切回 96——这是标注台里允许的人工选择，不是默认值兜底。</p>
+  </div>
+  <div>
+    <h3>边界</h3>
+    <p>本站是纯静态页：标注台走<b>浏览器内近似分析</b>；完整的 <code>analyze.py</code>/MERT 需要本地 Python，不在云端运行。
+    页面不包含任何原曲或带原声的成片；音频只在你本机浏览器里处理。</p>
+  </div>
+</footer>
+</body>
+</html>

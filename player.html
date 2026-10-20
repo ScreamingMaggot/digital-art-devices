@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>演示 · 数字艺术装置</title>
+<style>
+  :root{--bg:#070a0d;--ink:#dfe6ee;--dim:#8fa0b3;--line:#2b333c;--amber:#ffb24d}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);overflow:hidden;
+    font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  #bar{height:38px;display:flex;align-items:center;gap:14px;padding:0 14px;border-bottom:1px solid var(--line);
+    background:rgba(7,10,13,.98);font:12.5px/1 ui-monospace,Consolas,monospace;position:relative;z-index:3}
+  #bar a{color:var(--amber);text-decoration:none;white-space:nowrap}
+  #bar a:hover{color:#ffd29a}
+  #bar .t{color:var(--ink);letter-spacing:.04em;white-space:nowrap}
+  #bar .s{color:var(--dim);flex:1;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #bar button{font:inherit;font-size:12px;background:#141a20;color:#c3d0dd;border:1px solid var(--line);
+    border-radius:3px;padding:3px 9px;cursor:pointer}
+  #bar button:hover{border-color:#4a5665}
+  #view{display:block;width:100%;height:calc(100% - 38px);border:0;background:#070a0d}
+  #err{position:fixed;inset:38px 0 0;display:none;align-items:center;justify-content:center;padding:30px;
+    background:rgba(7,10,13,.96);color:#ffb24d;font-size:14px;line-height:1.8;text-align:center;z-index:4}
+</style>
+</head>
+<body>
+<div id="bar">
+  <a href="index.html">← 启动台</a>
+  <span class="t" id="ttl">演示</span>
+  <span class="s" id="st">正在准备…</span>
+  <button id="again" title="重新投递演示数据">重送</button>
+</div>
+<iframe id="view" allow="autoplay" title="装置"></iframe>
+<div id="err"></div>
+
+<script src="demo/demo.js"></script>
+<script>
+'use strict';
+const NAMES={a:'A · 频谱传动引擎',b:'B · 擒纵调速钟',c:'C · 地层档案压机',d:'D · 音符液压柱',mv:'MV · 分镜夜行'};
+const q=new URLSearchParams(location.search);
+const p=(q.get('p')||'mv').toLowerCase();
+const demo=q.get('demo')!=='0';
+const view=document.getElementById('view'), st=document.getElementById('st'), err=document.getElementById('err');
+document.getElementById('ttl').textContent=NAMES[p]||'演示';
+document.title=(NAMES[p]||'演示')+' · 数字艺术装置';
+
+function fail(msg){err.style.display='flex';err.textContent=msg;st.textContent='出错';}
+if(!window.__DEMO__){
+  fail('没有找到演示数据（demo/demo.js 缺失）。\n可以直接把 devices/'+p+'.html 当单文件打开，再拖入自己的 features.json。');
+}else{
+  view.src='devices/'+p+'.html';
+}
+
+let acked=false, tries=0, timer=null;
+const bundle=()=>{
+  const D=window.__DEMO__;
+  return {kind:'annotator-bundle',v:1,sent_at:new Date().toISOString(),
+    project:{name:D.title||'课堂演示',id:'demo',duration:(D.features&&D.features.source&&D.features.source.duration)||60,
+      bpm:(D.features&&D.features.rhythm&&D.features.rhythm.bpm)||96,
+      bpm_source:'人工输入',feats_from:'demo'},
+    features:D.features,regions:D.regions||[],markers:[]};
+};
+function b64buf(s){
+  const bin=atob(s), u=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);
+  return u.buffer;
+}
+function postAll(){
+  const w=view.contentWindow;if(!w)return;
+  try{w.postMessage(bundle(),'*');}catch(e){fail('投递 bundle 失败：'+e.message);return;}
+  tries++;st.textContent='送入演示数据… 第 '+tries+' 次';
+}
+function start(){
+  if(!window.__DEMO__)return;
+  acked=false;tries=0;clearInterval(timer);
+  postAll();
+  timer=setInterval(()=>{if(acked||tries>=12){clearInterval(timer);return;}postAll();},500);
+  setTimeout(()=>{if(!acked&&tries>=12){st.textContent='装置没有回执：打开控制台看 JS 错误';}},6600);
+}
+window.addEventListener('message',ev=>{
+  const d=ev&&ev.data;if(!d||d.kind!=='annotator-bundle-ack')return;
+  if(acked)return;acked=true;clearInterval(timer);
+  const D=window.__DEMO__, w=view.contentWindow;
+  try{
+    w.postMessage({kind:'annotator-timeline',text:JSON.stringify(D.timeline)},'*');
+    const buf=b64buf(D.audio_b64);
+    w.postMessage({kind:'annotator-audio',name:D.audio_name||'demo.mp3',type:D.audio_type||'audio/mpeg',buf:buf},'*');
+    st.textContent='已送入：数据 + timeline + 声音 · 若无声点一下画面';
+  }catch(e){st.textContent='回执已到，但音频/timeline 投递失败：'+e.message;}
+});
+view.addEventListener('load',()=>{if(demo)start();else st.textContent='未带演示数据';});
+document.getElementById('again').onclick=()=>start();
+</script>
+</body>
+</html>

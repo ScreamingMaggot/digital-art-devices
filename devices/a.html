@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>A · 频谱传动引擎 — 机械装置</title>
+<style>
+:root{--bg:#0b0d10;--panel:#13171c;--ink:#dfe6ee;--dim:#8fa0b3;--amber:#ffb24d;--red:#ff7b6e;--line:#2a323c}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;overflow:hidden}
+#hdr{height:44px;display:flex;align-items:center;gap:10px;padding:0 12px;border-bottom:1px solid var(--line);font-size:13px}
+#hdr b{font-size:15px;letter-spacing:.5px;white-space:nowrap}
+.badge{padding:2px 9px;border:1px solid var(--line);border-radius:10px;font-size:12px;color:var(--dim);background:#0f1317;white-space:nowrap}
+.badge.warn{color:var(--amber);border-color:#5a4318}.badge.bad{color:var(--red);border-color:#5a2320}
+.badge.ok{color:var(--ink);border-color:#4a5665}
+#main{display:flex;height:calc(100% - 44px)}
+#stagewrap{flex:1;min-width:0;position:relative}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+#panel{width:322px;border-left:1px solid var(--line);background:var(--panel);overflow-y:auto;padding:10px 12px;font-size:12px;line-height:1.45}
+#panel h3{font-size:12px;margin:12px 0 4px;color:var(--amber);letter-spacing:1px;border-bottom:1px dashed var(--line);padding-bottom:2px}
+#panel .hint{color:var(--dim);font-size:11px}
+table.fields{width:100%;border-collapse:collapse;font-size:11.5px;table-layout:fixed}
+table.fields td{padding:1.5px 2px;vertical-align:top;border-bottom:1px solid #1b2128;word-break:break-all}
+table.fields td.f{color:var(--dim);font-family:Consolas,monospace;font-size:11px}
+table.fields td.v{color:var(--ink);text-align:right;font-family:Consolas,monospace;width:100px}
+table.fields td.m{color:var(--ink);width:60px}
+.drop{border:1px dashed #3b4652;border-radius:8px;padding:9px;margin:6px 0;text-align:center;color:var(--dim);font-size:12px;cursor:pointer}
+button{background:#1c232b;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:3px 9px;font-size:12px;cursor:pointer;margin:2px 2px 2px 0}
+button.sel{border-color:var(--amber);color:var(--amber)}
+input[type=range]{width:132px;vertical-align:middle}
+#dropAll{position:fixed;inset:0;pointer-events:none;border:3px solid transparent;z-index:9}
+#dropAll.on{border-color:var(--amber)}
+</style>
+</head>
+<body>
+<div id="hdr">
+  <b>A · 频谱传动引擎</b>
+  <span class="badge" id="bSong">曲目：未加载</span>
+  <span class="badge" id="bAudio">音频：无信号</span>
+  <span class="badge" id="bData">数据：未分析</span>
+  <span class="badge" id="bGroups">分组：未分析</span>
+  <span class="badge" id="bStems">分轨：未分析</span>
+  <span class="badge" id="bGrid">网格：未分析</span>
+  <span style="flex:1"></span>
+  <span class="hint" style="font-size:11px;color:var(--dim)">色表：琥珀=未确认/降级 · 红=非倍半音真分歧 · 其余中性冷色</span>
+</div>
+<div id="main">
+  <div id="stagewrap"><canvas id="stage"></canvas></div>
+  <div id="panel">
+    <div class="hint" id="srcLine" style="margin:2px 0 4px">数据源：未载入</div>
+    <div class="drop" id="dzFeat">拖入 / 点击选择 <b>*.features.json</b>（必需）<input type="file" id="fpFeat" hidden accept=".json"></div>
+    <div class="drop" id="dzAudio">拖入 / 点击选择 音频文件（可选，仅作走带与监听）<input type="file" id="fpAudio" hidden accept="audio/*"></div>
+    <h3>走带</h3>
+    <button id="btnPlay">▶ 走带</button>
+    <button id="btnRev">时间轴反转 t→dur−t</button>
+    <button id="btnReset">⟲ 归零</button><br>
+    <span id="spdBox"><button class="sel" data-s="1">1×</button><button data-s="0.5">0.5×</button><button data-s="2">2×</button></span>
+    <input type="range" id="scrub" min="0" max="1000" value="0"><span id="tRead" style="font-family:Consolas,monospace">0.00s</span>
+    <h3>标签占位账本（可读性自检）</h3>
+    <div class="hint" id="ledBox">未渲染</div>
+    <h3>这台机器此刻在读的字段</h3>
+    <div class="hint">每行 = 机构 ← 契约字段 ← 当前实际数值（与画面同一个 rAF 帧写入）。</div>
+    <table class="fields" id="fields"></table>
+    <h3>能量账本（守恒自检）</h3>
+    <table class="fields" id="ledger"></table>
+    <h3 id="hSecLedg" style="display:none">分段账面（标注台 regions 优先）</h3>
+    <table class="fields" id="secLedg"></table>
+    <h3>静态铭牌（绝对量）</h3>
+    <table class="fields" id="plate"></table>
+    <h3>分析器自证 verify</h3>
+    <div class="hint" id="verifyBox">未分析</div>
+  </div>
+</div>
+<div id="dropAll"></div>
+<script>
+"use strict";
+/* ================= 语义色表（唯一来源，README 有"色表"一节） =================
+   琥珀 = 未确认 / 降级 / 仅归一（不可跨曲比）；红 = 非倍半音真分歧；其余中性冷色。
+   6 个传动组用同一支冷色明度阶梯 RAMP 区分（靠明度+齿数+编号，不靠色相）。 */
+const C={bg:'#0b0d10',ink:'#dfe6ee',hi:'#c3d0dd',mid:'#93a5b8',dim:'#6d7f92',faint:'#4a5665',
+  frame:'#39434f',plate:'#12171d',plateEd:'#2b333c',amber:'#ffb24d',red:'#ff7b6e'};
+const RAMP=['#5d6d80','#6e8093','#7f93a7','#90a5ba','#a1b7cc','#b3c9de'];
+const FONT='Consolas,"Courier New",monospace';
+const MINFONT=13.5;
+const L={W:1240,H:760};
+const cv=document.getElementById('stage'),ctx=cv.getContext('2d');
+const M={t:0,playing:false,dir:1,speed:1,f:null,err:''};
+let audioEl=null;
+const b64u8=s=>{const b=atob(s),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;};
+const nz=(v,d)=>Number.isFinite(v)?v.toFixed(d):'未分析';
+/* 数据文本上屏前先过一遍：契约里任何带省略号的原文换成"·"，屏幕永不出现 … / ... */
+const noell=s=>String(s).replace(/…/g,'·').replace(/\.\.\./g,'·');
+const txt=v=>(v==null||v===''||v===undefined)?'未提供':noell(v);
+const el=id=>document.getElementById(id);
+function fitCanvas(){const r=cv.getBoundingClientRect(),d=Math.min(window.devicePixelRatio||1,2);
+  cv.width=Math.max(2,Math.round(r.width*d));cv.height=Math.max(2,Math.round(r.height*d));
+  const s=Math.min(cv.width/L.W,cv.height/L.H);
+  ctx.setTransform(s,0,0,s,(cv.width-L.W*s)/2,(cv.height-L.H*s)/2);window.__scale=s;}
+new ResizeObserver(fitCanvas).observe(cv);
+
+/* ================= 标签占位账本 label ledger（与 B/C/D 同一实现） =================
+   任何 fillText 都必须经 LG.add 排队 → LG.flush 落笔。落笔前算出文字包围盒，
+   与「已登记文字盒 + 机构禁画区」逐个求交；相交则挪位（8 方向×4 档）→ 缩字号（≥MINFONT）
+   → 仍无解则省略该标签。label_collisions = 真的相交还落笔的次数，必须为 0。      */
+let LEDGER_PROBE={detected:0,clean:0,e2e:0,ok:false};
+const LG={
+  occ:[],q:[],st:null,bounds:{x0:0,y0:0,x1:L.W,y1:L.H},
+  reset(b){this.occ=[];this.q=[];this.bounds=b||{x0:0,y0:0,x1:L.W,y1:L.H};
+    this.st={checked:0,drawn:0,dropped:0,relocated:0,shrunk:0,collisions:0,overlap_events:0,geom:0,ellipsis:0,minfont:999};},
+  hit(a,b){return a.x0<b.x1&&b.x0<a.x1&&a.y0<b.y1&&b.y0<a.y1;},
+  block(x0,y0,x1,y1){this.occ.push({x0,y0,x1,y1,g:1});this.st.geom++;},
+  overlaps(r){let n=0;for(let k=0;k<this.occ.length;k++)if(this.hit(this.occ[k],r))n++;return n;},
+  box(x,y,t,s,align){ctx.save();ctx.font=s+'px '+FONT;const w=ctx.measureText(t).width;ctx.restore();
+    const h=s*1.3,x0=align==='center'?x-w/2:align==='right'?x-w:x;
+    return {x0:x0,y0:y-h/2,x1:x0+w,y1:y+h/2,w:w,h:h};},
+  add(prio,x,y,text,size,col,align,opt){this.q.push({prio:prio,x:x,y:y,text:String(text),
+    size:Math.max(MINFONT,size||MINFONT),col:col||C.mid,align:align||'left',opt:opt||{}});},
+  clamp(r){const b=this.bounds;let dx=0,dy=0;
+    if(r.x0<b.x0)dx=b.x0-r.x0; if(r.x1>b.x1)dx=b.x1-r.x1;
+    if(r.y0<b.y0)dy=b.y0-r.y0; if(r.y1>b.y1)dy=b.y1-r.y1;
+    return {x0:r.x0+dx,y0:r.y0+dy,x1:r.x1+dx,y1:r.y1+dy,w:r.w,h:r.h};},
+  note(s,t){this.st.minfont=Math.min(this.st.minfont,s);
+    if(/[…]|(\.\.\.)/.test(t))this.st.ellipsis++;},
+  place(it){this.st.checked++;
+    const sizes=it.opt.noshrink?[it.size]:[it.size,Math.max(MINFONT,it.size*0.9),Math.max(MINFONT,it.size*0.82)];
+    const st=it.size*1.45;let offs=[[0,0]];
+    if(!it.opt.fixed){for(const rad of [1,2,3,5])for(const d of [[0,1],[0,-1],[1,0],[-1,0],[1,1],[-1,1],[1,-1],[-1,-1]])
+      offs.push([d[0]*st*rad*1.1,d[1]*st*rad]);}
+    for(let si=0;si<sizes.length;si++){const s=sizes[si];
+      for(let oi=0;oi<offs.length;oi++){
+        const r=this.clamp(this.box(it.x+offs[oi][0],it.y+offs[oi][1],it.text,s,it.align));
+        const n=this.overlaps(r);
+        if(n===0){if(si>0)this.st.shrunk++;if(oi>0)this.st.relocated++;
+          this.commit(r,it,s);this.occ.push(r);this.st.drawn++;this.note(s,it.text);return true;}
+        this.st.overlap_events+=n;}}
+    if(it.opt.must){const r=this.clamp(this.box(it.x,it.y,it.text,it.size,it.align));
+      this.st.collisions+=this.overlaps(r);this.commit(r,it,it.size);this.occ.push(r);this.st.drawn++;
+      this.note(it.size,it.text);return true;}
+    this.st.dropped++;this.st.drop_list=this.st.drop_list||[];
+    if(this.st.drop_list.length<6)this.st.drop_list.push(it.text);return false;},
+  commit(r,it,s){if(it.opt.plate){ctx.fillStyle=C.plate;ctx.fillRect(r.x0-3,r.y0-2,r.w+6,r.h+4);
+      ctx.strokeStyle=C.plateEd;ctx.lineWidth=1;ctx.strokeRect(r.x0-3,r.y0-2,r.w+6,r.h+4);}
+    ctx.fillStyle=it.col;ctx.font=s+'px '+FONT;ctx.textAlign=it.align;ctx.textBaseline='middle';
+    ctx.fillText(it.text,(it.align==='center')?(r.x0+r.x1)/2:(it.align==='right'?r.x1:r.x0),(r.y0+r.y1)/2);
+    ctx.textAlign='left';ctx.textBaseline='alphabetic';},
+  flush(){this.q.sort((a,b)=>a.prio-b.prio);for(let k=0;k<this.q.length;k++)this.place(this.q[k]);
+    window.__SELFTEST__={device:'A-频谱传动引擎',label_collisions:this.st.collisions,label_checked:this.st.checked,
+      label_drawn:this.st.drawn,label_dropped:this.st.dropped,label_relocated:this.st.relocated,
+      label_shrunk:this.st.shrunk,label_overlap_events:this.st.overlap_events,geom_kepts:this.st.geom,
+      label_ellipsis:this.st.ellipsis,min_drawn_font_px:this.st.drawn?Math.round(this.st.minfont*100)/100:null,
+      label_dropped_text:this.st.drop_list||[],
+      min_font_px:MINFONT,ledger_detect_synth:LEDGER_PROBE.detected,ledger_selftest_ok:LEDGER_PROBE.ok,
+      ledger_e2e_forced:LEDGER_PROBE.e2e,
+      scale_px:Math.round((window.__scale||1)*1000)/1000,
+      min_rendered_font_px:Math.round(MINFONT*(window.__scale||1)*100)/100};}
+};
+/* 账本自证（防"假绿"）：求交原语 + 端到端"落笔即登记" */
+LEDGER_PROBE=(function(){
+  LG.reset({x0:0,y0:0,x1:L.W,y1:L.H});
+  LG.occ.push(LG.box(120,120,'0000000000',16,'left'));
+  const same=LG.overlaps(LG.box(120,120,'0000000000',16,'left'));
+  const far=LG.overlaps(LG.box(900,500,'0000000000',16,'left'));
+  LG.reset({x0:0,y0:0,x1:L.W,y1:L.H});
+  LG.add(0,120,120,'ZZZZZZZZZZ',16,C.ink,'left');
+  LG.add(0,120,120,'ZZZZZZZZZZ',16,C.ink,'left');
+  LG.flush();
+  const e2e=LG.st.relocated+LG.st.dropped;
+  LG.reset();ctx.clearRect(0,0,L.W,L.H);
+  return {detected:same,clean:far,e2e:e2e,ok:(same===1&&far===0&&e2e>=1)};})();
+function label(prio,x,y,s,size,col,align,opt){LG.add(prio,x,y,s,size,col,align,opt);}
+/* 预置短名选档（README 有缩写表）：pick 取第一条放得下的候选；lab 把选中的名字登记进账本。
+   一条都放不下 → 整条省略并计入 label_dropped。绝不出现带省略号的残名。 */
+function pick(cands,maxw,size){ctx.save();ctx.font=(size||MINFONT)+'px '+FONT;let t=null;
+  for(let k=0;k<cands.length;k++){const c=noell(cands[k]);
+    if(ctx.measureText(c).width<=maxw){t=c;break;}}
+  ctx.restore();return t;}
+function lab(prio,x,y,cands,maxw,size,col,align,opt){LG.st.checked++;
+  const t=pick(cands,maxw,size);
+  if(t===null){LG.st.dropped++;LG.st.drop_list=LG.st.drop_list||[];
+    const last=noell(cands[cands.length-1]);
+    if(LG.st.drop_list.length<6&&LG.st.drop_list.indexOf(last)<0)LG.st.drop_list.push(last);return;}
+  LG.add(prio,x,y,t,size,col,align,opt);}
+
+/* ================= 绘图元件（全部中性冷色） ================= */
+function screw(x,y,r){ctx.strokeStyle=C.faint;ctx.lineWidth=1.2;ctx.beginPath();ctx.arc(x,y,r,0,7);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(x-r*0.7,y);ctx.lineTo(x+r*0.7,y);ctx.stroke();}
+function gear(x,y,r,teeth,ang,col,lw,opts){opts=opts||{};ctx.save();ctx.translate(x,y);ctx.rotate(ang);
+  ctx.strokeStyle=col;ctx.lineWidth=lw||2.2;ctx.beginPath();
+  const ro=r+(opts.tooth==null?6:opts.tooth);
+  for(let i=0;i<teeth;i++){const a0=i/teeth*Math.PI*2,a1=(i+0.42)/teeth*Math.PI*2;
+    ctx.lineTo(Math.cos(a0)*r,Math.sin(a0)*r);ctx.lineTo(Math.cos(a0)*ro,Math.sin(a0)*ro);
+    ctx.lineTo(Math.cos(a1)*ro,Math.sin(a1)*ro);ctx.lineTo(Math.cos(a1)*r,Math.sin(a1)*r);}
+  ctx.closePath();ctx.stroke();
+  if(opts.spokes){ctx.lineWidth=1.6;for(let k=0;k<opts.spokes;k++){const a=k/opts.spokes*Math.PI*2;
+    ctx.beginPath();ctx.moveTo(Math.cos(a)*r*0.3,Math.sin(a)*r*0.3);ctx.lineTo(Math.cos(a)*r*0.9,Math.sin(a)*r*0.9);ctx.stroke();}}
+  ctx.beginPath();ctx.arc(0,0,opts.hub||r*0.26,0,7);ctx.stroke();
+  ctx.fillStyle=col;ctx.beginPath();ctx.arc(0,0,2.6,0,7);ctx.fill();
+  ctx.restore();}
+function arbor(x,y,r){ctx.strokeStyle=C.faint;ctx.lineWidth=1.4;ctx.beginPath();ctx.arc(x,y,r,0,7);ctx.stroke();
+  ctx.fillStyle=C.hi;ctx.beginPath();ctx.arc(x,y,2.2,0,7);ctx.fill();}
+function rod(x0,y0,x1,y1,col,w){ctx.strokeStyle=col||C.mid;ctx.lineWidth=w||3;
+  ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.stroke();}
+function hatch(x,y,w,h,col){ctx.save();ctx.beginPath();ctx.rect(x,y,w,h);ctx.clip();
+  ctx.strokeStyle=col||'#161b21';ctx.lineWidth=1;
+  for(let k=-h;k<w+h;k+=9){ctx.beginPath();ctx.moveTo(x+k,y);ctx.lineTo(x+k-h,y+h);ctx.stroke();}ctx.restore();}
+function panelBox(x,y,w,h){ctx.fillStyle=C.plate;ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle=C.plateEd;ctx.lineWidth=1.4;ctx.strokeRect(x,y,w,h);}
+function bay(x0,y0,x1,y1){ctx.strokeStyle=C.frame;ctx.lineWidth=1.6;ctx.strokeRect(x0,y0,x1-x0,y1-y0);
+  hatch(x0+1,y0+1,x1-x0-2,y1-y0-2);
+  for(const p of [[x0+9,y0+9],[x1-9,y0+9],[x0+9,y1-9],[x1-9,y1-9]])screw(p[0],p[1],3.6);}
+function gauge(x,y,r,frac,title,val,col,ok){ctx.save();
+  ctx.strokeStyle=C.frame;ctx.lineWidth=3;ctx.beginPath();ctx.arc(x,y,r,-Math.PI*0.92,Math.PI*0.92);ctx.stroke();
+  const a=-Math.PI*0.92+Math.max(0,Math.min(1,ok?frac:0))*Math.PI*1.84;
+  ctx.strokeStyle=ok?col:C.faint;ctx.lineWidth=2.6;ctx.beginPath();ctx.moveTo(x,y);
+  ctx.lineTo(x+Math.cos(a)*r*0.8,y+Math.sin(a)*r*0.8);ctx.stroke();
+  ctx.fillStyle=C.hi;ctx.beginPath();ctx.arc(x,y,3,0,7);ctx.fill();
+  ctx.restore();}
+
+/* ================= 解码 ================= */
+function resolveGroups(F){ /* 官方 bands.groups 优先；缺失即降级并在画面明写，不在装置侧挑 Hz 阈值 */
+  const g=F&&F.bands&&F.bands.groups;
+  if(Array.isArray(g)&&g.length){
+    const ok=g.every(x=>Number.isFinite(x.i0)&&Number.isFinite(x.i1)&&x.i0>=0&&x.i1<=96&&x.i1>x.i0);
+    if(ok)return {groups:g.slice().sort((a,b)=>a.i0-b.i0),official:true};}
+  return {groups:null,official:false};}
+function decode(F){
+  const src=F.source||{};const fr=src.frames|0,fps=src.fps||30,dur=src.duration||fr/fps;
+  if(!F.bands||!F.bands.data_b64||!fr)throw new Error('缺 bands/source.frames');
+  const bands=b64u8(F.bands.data_b64);
+  if(bands.length<fr*96)throw new Error('bands 长度不符');
+  const edges=(F.bands.edges_hz||[]).slice();
+  const gr=resolveGroups(F);
+  const groups=gr.groups||[];const nG=groups.length;
+  const gmean=new Float32Array(fr*Math.max(1,nG)),gcum=[];
+  for(let k=0;k<nG;k++)gcum.push(new Float64Array(fr+1));
+  const rowG=new Float32Array(fr);
+  for(let i=0;i<fr;i++){const off=i*96;
+    for(let k=0;k<nG;k++){let a=0;for(let b=groups[k].i0;b<groups[k].i1;b++)a+=bands[off+b];
+      gmean[i*nG+k]=a/255/Math.max(1,groups[k].i1-groups[k].i0);}
+    let s=0;for(let b=0;b<96;b++)s+=bands[off+b];rowG[i]=s/255/96;
+    for(let k=0;k<nG;k++)gcum[k][i+1]=gcum[k][i]+gmean[i*nG+k];}
+  const crv={};for(const k of ['rms','onset','flux','cent','rolloff','flatness','lowhigh','tension'])
+    crv[k]=(F.curves&&F.curves[k])?b64u8(F.curves[k]):null;
+  const centMax=(F.curves_hz&&Number.isFinite(F.curves_hz.cent_max))?F.curves_hz.cent_max:NaN;
+  let stems=null;
+  if(Array.isArray(F.stems)&&F.stems.length)stems=F.stems.map(st=>({
+    id:st.id,label:st.label,kind:st.kind,band_hz:st.band_hz,activity:st.activity,dead:st.dead===true,
+    centroid_hz:st.centroid_hz,lufs_like_db:st.lufs_like_db,peak_dbfs:st.peak_dbfs,note:st.note,
+    env:st.env_b64?b64u8(st.env_b64):null,
+    cum:(()=>{if(!st.env_b64)return null;const e=b64u8(st.env_b64),c=new Float64Array(fr+1);
+      for(let i=0;i<fr&&i<e.length;i++)c[i+1]=c[i]+e[i]/255;return c;})()}));
+  const m=F.meter||{};
+  let lufs=null;if(m.lufs_frame_b64){const u=b64u8(m.lufs_frame_b64);lufs=new Float32Array(u.length);
+    for(let i=0;i<u.length;i++)lufs[i]=u[i]/255*60-60;}
+  M.f={raw:F,fr,fps,dur,bands,edges,groups,nG,official:gr.official,gmean,gcum,rowG,crv,centMax,stems,lufs,
+    meter:m,key:F.key||null,mood:F.mood||null,rhythm:F.rhythm||null,name:src.name||'未知来源'};
+}
+const frameAt=t=>Math.max(0,Math.min(M.f.fr-1,Math.floor(t*M.f.fps+0.5)));
+/* Hz 区间短记法（README 缩写表）：≥1000 写成 k（一位小数、去尾零），仅当上界<1000 才带 Hz 尾缀 */
+function hzRange(a,b){const f=v=>v>=1000?(Math.round(v/100)/10+'k'):String(Math.round(v));
+  return f(a)+'-'+f(b)+(b<1000?'Hz':'');}
+
+/* ================= 外壳骨架 ================= */
+const HEAD={y0:70,y1:112},BODY={y0:118,y1:668},FOOT={y0:676,y1:734};
+function chassis(title,legend){
+  ctx.fillStyle=C.bg;ctx.fillRect(0,0,L.W,L.H);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=2;ctx.strokeRect(20,20,L.W-40,L.H-40);
+  ctx.strokeStyle='#20272f';ctx.lineWidth=1;ctx.strokeRect(26,26,L.W-52,L.H-52);
+  for(const p of [[34,34],[L.W-34,34],[34,L.H-34],[L.W-34,L.H-34]])screw(p[0],p[1],5);
+  ctx.strokeStyle=C.frame;
+  ctx.beginPath();ctx.moveTo(26,64);ctx.lineTo(L.W-26,64);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(26,HEAD.y1+2);ctx.lineTo(L.W-26,HEAD.y1+2);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(26,FOOT.y0-6);ctx.lineTo(L.W-26,FOOT.y0-6);ctx.stroke();
+  lab(0,40,44,Array.isArray(title)?title:[title],760,16,C.ink,'left',{fixed:true,must:true,noshrink:true});
+  lab(0,L.W-40,44,[legend],420,13.5,C.dim,'right',{fixed:true,must:true});
+}
+
+/* ================= 渲染（t 的纯函数） ================= */
+function render(t){
+  const f=M.f,i=frameAt(t),nG=f.nG;
+  LG.reset({x0:30,y0:30,x1:L.W-30,y1:L.H-26});
+  chassis('A · 频谱传动引擎 — 96 带=输入歧管 · 官方分组=传动齿轮 · 飞轮=∫Σbands',
+          '色表：琥珀=未确认/降级 · 红=非倍半音真分歧');
+  const g=new Float32Array(nG);for(let k=0;k<nG;k++)g[k]=f.gmean[i*nG+k];
+  const total=f.rowG[i];
+  let wsum=0;for(let k=0;k<nG;k++)wsum+=g[k]*(f.groups[k].i1-f.groups[k].i0)/96;
+  const cumTotal=(()=>{let s=0;for(let k=0;k<nG;k++)s+=f.gcum[k][i]*(f.groups[k].i1-f.groups[k].i0)/96;return s;})();
+  const fwAng=cumTotal*(2*Math.PI/180);
+  /* 房间光：整幅画布的连续通道（引擎所在的厂房）。舞台外的空白也要跟着音乐呼吸——
+     装置是前端动画不是仪表盘；光画在面板之下，不碰任何文字。 */
+  {
+    const rA=Math.max(0,Math.min(1,total)), phA=fwAng*3;
+    /* 事件脉冲：光不只慢飘，还要在 onset 上闪一下——否则成片里"画面在动"与"音乐事件"的相关会被慢光稀释。
+       修前成片解码实测 A +0.218 → 加光后掉到 +0.128（门槛 0.2）。 */
+    const onA=f.crv.onset?Math.max(0,Math.min(1,f.crv.onset[i]/255)):0;
+    for(const gl of [[0.26,0.30,0.58,'150,172,200'],[0.74,0.70,0.50,'118,138,168']]){
+      const cx=L.W*(gl[0]+0.08*Math.sin(phA*0.55+gl[0]*11)),
+            cy=L.H*(gl[1]+0.05*Math.cos(phA*0.40+gl[1]*7));
+      const rg=ctx.createRadialGradient(cx,cy,0,cx,cy,L.W*gl[2]);
+      rg.addColorStop(0,'rgba('+gl[3]+','+Math.min(0.24,0.05+0.09*rA+0.07*onA).toFixed(3)+')');
+      rg.addColorStop(1,'rgba('+gl[3]+',0)');
+      ctx.fillStyle=rg;ctx.fillRect(0,0,L.W,L.H);
+    }
+  }
+
+  /* ---------- 顶栏状态牌（预置短名选档，放不下整条省略，绝不截断） ---------- */
+  lab(0,40,HEAD.y0+14,f.official
+    ?['分组 bands.groups：官方 '+nG+' 组（i0:i1 左闭右开）','分组 bands.groups：官方 '+nG+' 组','分组：官方下发 '+nG+' 组']
+    :['分组 bands.groups：未下发 → 机组停转（不自行挑 Hz）','分组 bands.groups：未下发 → 机组停转','分组：未下发（降级）'],
+    372,14,f.official?C.ink:C.amber,'left',{fixed:true,must:true});
+  lab(0,420,HEAD.y0+14,['bands.norm = '+txt(f.raw.bands&&f.raw.bands.norm).replace(' -> ','→'),'归一：'+txt(f.raw.bands&&f.raw.bands.norm)],
+    372,14,C.amber,'left',{fixed:true,must:true});
+  lab(0,800,HEAD.y0+14,['source.frames = '+f.fr+' · fps = '+txt(f.raw.source.fps||30)+' · 全长 '+nz(f.dur,1)+'s',
+    'frames '+f.fr+' · 全长 '+nz(f.dur,1)+'s','frames '+f.fr],372,14,C.dim,'left',{fixed:true,must:true});
+  lab(0,40,HEAD.y0+36,['本帧总驱动 Σ96带 = '+nz(total,3)+'（归一）','Σ96带 = '+nz(total,3)+'（归一）','Σ96带 '+nz(total,3)],
+    372,13.5,C.hi,'left',{fixed:true,must:true});
+  lab(0,420,HEAD.y0+36,['分配账面 Σg·带宽 = '+nz(wsum,3)+' · 残差 '+nz(total-wsum,4),'Σg·带宽 = '+nz(wsum,3)+' · 残差 '+nz(total-wsum,4)],
+    372,13.5,f.official?C.hi:C.amber,'left',{fixed:true,must:true});
+  lab(0,800,HEAD.y0+36,f.stems
+    ?['伪分轨 stems：'+f.stems.length+' 条（频带近似·非真乐器分离）','伪分轨 stems：'+f.stems.length+' 条（频带近似）','stems：'+f.stems.length+' 条']
+    :['伪分轨 stems：未分析'],372,13.5,f.stems?C.hi:C.amber,'left',{fixed:true,must:true});
+
+  /* ---------- 机位 1：输入歧管 96 根推杆 ---------- */
+  const P1={x0:36,y0:BODY.y0,x1:218,y1:BODY.y1};bay(P1.x0,P1.y0,P1.x1,P1.y1);
+  label(1,P1.x0+12,P1.y0+18,'输入歧管 bands[96]',14,C.ink,'left');
+  const my0=P1.y0+34,my1=P1.y1-16,pitch=(my1-my0)/96;
+  for(let b=0;b<96;b++){const yy=my1-(b+0.5)*pitch;const v=f.bands[i*96+b]/255;
+    let k=0;if(f.official){while(k<nG&&b>=f.groups[k].i1)k++;}
+    ctx.strokeStyle=f.official?RAMP[Math.min(k,nG-1)]:C.faint;ctx.globalAlpha=0.45+0.55*v;ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(P1.x0+10,yy);ctx.lineTo(P1.x0+10+v*150,yy);ctx.stroke();}
+  ctx.globalAlpha=1;
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.4;ctx.strokeRect(P1.x0+9,my0-2,152,my1-my0+4);
+  if(f.official)for(let k=1;k<nG;k++){const yy=my1-f.groups[k].i0*pitch;
+    ctx.strokeStyle=C.faint;ctx.setLineDash([4,3]);ctx.lineWidth=1;ctx.beginPath();
+    ctx.moveTo(P1.x0+9,yy);ctx.lineTo(P1.x0+161,yy);ctx.stroke();ctx.setLineDash([]);}
+  label(3,P1.x0+12,P1.y1-4,'32Hz → 11kHz 对数带',13.5,C.dim,'left');
+  LG.block(P1.x0+8,my0-4,P1.x1-6,my1+4);
+
+  /* ---------- 机位 2：主飞轮 + 离心调速器 + 曲柄活塞 ---------- */
+  const P2={x0:224,y0:BODY.y0,x1:470,y1:BODY.y1};bay(P2.x0,P2.y0,P2.x1,P2.y1);
+  const FX=344,FY=404,FR=84;
+  rod(FX,(my0+my1)/2,P2.x0,FY,C.frame,4);
+  /* 齿圈就是飞轮自己的齿轮牙：与轮体同轴同向（原来给 -fwAng*0.5，
+     看起来像轮子正转、牙圈反转——他一眼挑出"有一个齿轮方向不对"）*/
+  gear(FX,FY,FR+10,40,fwAng,C.mid,2,{tooth:8});
+  ctx.save();ctx.translate(FX,FY);ctx.rotate(fwAng);
+  ctx.strokeStyle=C.hi;ctx.lineWidth=2.4;
+  for(let k=0;k<6;k++){const a=k*Math.PI/3;ctx.beginPath();ctx.moveTo(0,0);ctx.lineTo(Math.cos(a)*FR,Math.sin(a)*FR);ctx.stroke();}
+  ctx.beginPath();ctx.arc(0,0,FR,0,7);ctx.stroke();ctx.restore();arbor(FX,FY,8);
+  const rpm=Math.min(1,total*3);
+  ctx.fillStyle='rgba(255,178,77,'+(0.45+0.55*rpm)+')';ctx.beginPath();ctx.arc(FX,FY,9+13*rpm,0,7);ctx.fill();
+  LG.block(FX-FR-14,FY-FR-14,FX+FR+14,FY+FR+14);
+  label(1,FX,FY-FR-24,'主飞轮 ω=∫Σbands',14,C.ink,'center');
+  /* 离心调速器（装在飞轮轴上，球高=tension，开度=总驱动） */
+  const ten=f.crv.tension?f.crv.tension[i]/255:NaN;
+  const spread=0.25+0.6*Math.min(1,total*2.2),gy=186;
+  ctx.strokeStyle=C.frame;ctx.lineWidth=3;rod(FX,FY-FR-16,FX,gy-16,C.frame,3);
+  for(const sgn of[-1,1]){const bx=FX+sgn*(50*spread),by=gy+34*(1-spread);
+    ctx.strokeStyle=C.mid;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(FX,gy-10);ctx.lineTo(bx,by);ctx.stroke();
+    ctx.fillStyle=C.mid;ctx.beginPath();ctx.arc(bx,by,8,0,7);ctx.fill();
+    ctx.strokeStyle=C.hi;ctx.lineWidth=1.2;ctx.beginPath();ctx.arc(bx,by,8,0,7);ctx.stroke();}
+  ctx.fillStyle=C.hi;ctx.beginPath();ctx.arc(FX,gy-14,3.4,0,7);ctx.fill();
+  label(1,FX,gy-34,'离心调速器 球高←tension 开度←Σ',14,C.ink,'center');
+  label(3,FX,gy+62,'tension '+nz(ten,3)+'（归一）',13.5,C.amber,'center');
+  /* 曲柄活塞：最低组的帧间差分 = 节拍冲量 */
+  const lowP=f.official?g[0]:0,lowPrev=f.official?(i>2?f.gmean[(i-2)*f.nG+0]:lowP):0;
+  const kick=Math.max(0,Math.min(1,(lowP-lowPrev)*4));
+  const PY=FY+FR+36;
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.6;ctx.strokeRect(FX-70,PY-14,140,30);
+  const crank=-fwAng*1.6,cpx=FX+Math.cos(crank)*52,cpy=PY+Math.sin(crank)*10;
+  rod(FX-58+kick*36+lowP*70,PY,cpx,cpy,C.hi,3);
+  ctx.fillStyle=C.hi;ctx.fillRect(FX-62+lowP*96+kick*24,PY-8,24,16);
+  ctx.strokeStyle=C.mid;ctx.lineWidth=1.6;ctx.beginPath();ctx.arc(FX,PY,12,0,7);ctx.stroke();
+  label(1,FX,PY+32,'曲柄活塞 ← 最低组帧间差分',14,C.ink,'center');
+  label(3,FX,PY+50,'冲量 '+nz(kick,3)+' · 组均值 '+nz(lowP,3),13.5,C.mid,'center');
+
+  /* ---------- 机位 3：官方分组传动齿轮列 ---------- */
+  const P3={x0:476,y0:BODY.y0,x1:712,y1:BODY.y1};bay(P3.x0,P3.y0,P3.x1,P3.y1);
+  label(1,P3.x0+12,P3.y0+18,'传动机组（bands.groups）',14,C.ink,'left');
+  ctx.strokeStyle=C.frame;ctx.lineWidth=3;
+  rod(P3.x0+18,P3.y0+30,P3.x0+18,P3.y1-30,C.frame,3);rod(P3.x1-18,P3.y0+30,P3.x1-18,P3.y1-30,C.frame,3);
+  if(!f.official){
+    for(let k=0;k<6;k++){const yy=P3.y0+62+k*88;
+      ctx.strokeStyle=C.faint;ctx.setLineDash([5,5]);ctx.lineWidth=1.6;ctx.beginPath();
+      ctx.arc(P3.x0+62,yy,26,0,7);ctx.stroke();ctx.setLineDash([]);
+      label(2,P3.x0+100,yy,'备用位 '+(k+1),13.5,C.faint,'left');}
+    label(0,P3.x0+118,P3.y1-24,'分组未下发：机组停转',14,C.amber,'center',{fixed:true,must:true});
+  }else{
+    const step=(P3.y1-P3.y0-56)/nG;
+    for(let k=0;k<nG;k++){const yy=P3.y0+36+step*(k+0.5),gr=Math.min(28,step*0.32);
+      const nb=f.groups[k].i1-f.groups[k].i0;
+      const ang=-f.gcum[k][i]*(2*Math.PI/120);
+      ctx.strokeStyle=C.faint;ctx.lineWidth=1.4;rod(P3.x0+18,yy,P3.x0+62-gr-4,yy,C.faint,1.4);
+      gear(P3.x0+62,yy,gr,Math.max(8,Math.min(20,Math.round(nb/2.4))),ang,RAMP[k%6],2.2,{spokes:4,tooth:5});
+      arbor(P3.x0+62,yy,5);
+      LG.block(P3.x0+28,yy-gr-8,P3.x0+98,yy+gr+8);
+      lab(2,P3.x0+106,yy-16,[(k+1)+'·'+txt(f.groups[k].name)+' '+hzRange(f.groups[k].lo_hz,f.groups[k].hi_hz),
+        txt(f.groups[k].name)+' '+hzRange(f.groups[k].lo_hz,f.groups[k].hi_hz),(k+1)+'·'+txt(f.groups[k].name)],
+        124,13.5,C.ink,'left');
+      lab(3,P3.x0+106,yy+1,['带'+f.groups[k].i0+':'+f.groups[k].i1+' 轨'+txt(f.groups[k].stem||'—'),
+        '带'+f.groups[k].i0+':'+f.groups[k].i1,'轨'+txt(f.groups[k].stem||'—')],124,13.5,C.mid,'left');
+      lab(3,P3.x0+106,yy+17,['均值 '+nz(g[k],3),nz(g[k],3)],124,13.5,C.dim,'left');
+      /* 连杆：歧管 → 本组齿轮（证明能量真的传过来） */
+      const yyM=my1-((f.groups[k].i0+f.groups[k].i1)/2)*pitch;
+      ctx.strokeStyle=RAMP[k%6];ctx.globalAlpha=0.55;ctx.setLineDash([3,4]);ctx.lineWidth=1.2;ctx.beginPath();
+      ctx.moveTo(P1.x1-4,yyM);ctx.lineTo(P3.x0+14,yy);ctx.stroke();ctx.setLineDash([]);ctx.globalAlpha=1;}
+  }
+
+  /* ---------- 机位 4：散热风扇 + 散热片 + 三仪表 ---------- */
+  const P4={x0:718,y0:BODY.y0,x1:906,y1:BODY.y1};bay(P4.x0,P4.y0,P4.x1,P4.y1);
+  const hiK=f.official?nG-1:5,hiCum=f.official?f.gcum[hiK][i]:0,hiF=f.official?g[hiK]:NaN;
+  const HX=P4.x0+56,HY=P4.y0+78;
+  ctx.save();ctx.translate(HX,HY);ctx.rotate(-hiCum*(2*Math.PI/60));
+  ctx.strokeStyle=C.hi;ctx.lineWidth=2.4;
+  for(let b=0;b<7;b++){ctx.beginPath();ctx.moveTo(0,0);const a0=b/7*Math.PI*2;
+    ctx.quadraticCurveTo(Math.cos(a0+0.5)*30,Math.sin(a0+0.5)*30,Math.cos(a0)*46,Math.sin(a0)*46);ctx.stroke();}
+  ctx.restore();arbor(HX,HY,5);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.6;ctx.beginPath();ctx.arc(HX,HY,52,0,7);ctx.stroke();
+  LG.block(HX-56,HY-56,HX+56,HY+56);
+  label(1,HX,HY-66,'散热风扇',14,C.ink,'center');
+  lab(3,HX,HY+68,['最高组积分 '+(Number.isFinite(hiF)?nz(hiF,3):'分组未下发'),
+    Number.isFinite(hiF)?'最高组 '+nz(hiF,3):'分组未下发'],176,13.5,C.amber,'center');
+  /* 散热片 12 齿 = 最高组末 12 带；横移 = curves.flux 差分 */
+  const jit=(f.crv.flux&&i>6)?(f.crv.flux[i]/255-f.crv.flux[i-6]/255)*12:0;
+  const finLo=f.official?f.groups[hiK].i1-12:84;
+  const FY2=P4.y0+176;
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.4;ctx.strokeRect(P4.x0+14,FY2,154,90);
+  for(let b=0;b<12;b++){const bb=Math.min(95,finLo+b),v=f.bands[i*96+bb]/255;
+    const xx=P4.x0+22+b*12+jit;
+    ctx.strokeStyle=C.mid;ctx.globalAlpha=0.5+0.5*v;ctx.lineWidth=3;ctx.beginPath();
+    ctx.moveTo(xx,FY2+82);ctx.lineTo(xx,FY2+82-v*70);ctx.stroke();}
+  ctx.globalAlpha=1;
+  label(1,P4.x0+14,FY2+106,'散热片 12 齿 ← 末 12 带',13.5,C.ink,'left');
+  label(3,P4.x0+14,FY2+124,'横移 ← flux 差分 '+nz(jit/12,3),13.5,C.mid,'left');
+  /* 三仪表 */
+  const rmsV=f.crv.rms?f.crv.rms[i]/255:NaN,flaV=f.crv.flatness?f.crv.flatness[i]/255:NaN,cenV=f.crv.cent?f.crv.cent[i]/255:NaN;
+  const GY=P4.y1-84;
+  [['压力',rmsV],['阻尼',flaV],['质心',cenV]].forEach((gg,k)=>{
+    const gx=P4.x0+36+k*58;gauge(gx,GY,24,Number.isFinite(gg[1])?gg[1]:0,'','',C.mid,Number.isFinite(gg[1]));
+    label(2,gx,GY+36,gg[0],13.5,C.ink,'center');
+    label(3,gx,GY+54,Number.isFinite(gg[1])?nz(gg[1],2):'无',13.5,C.mid,'center');
+    LG.block(gx-28,GY-28,gx+28,GY+28);});
+  lab(3,P4.x0+14,P4.y1-8,['质心绝对 '+(Number.isFinite(f.centMax)?nz(f.centMax*(Number.isFinite(cenV)?cenV:0),0)+' Hz':'未提供'),
+    Number.isFinite(f.centMax)?'质心 '+nz(f.centMax*(Number.isFinite(cenV)?cenV:0),0)+'Hz':'质心 未提供'],176,13.5,C.hi,'left');
+
+  /* ---------- 机位 5：伪分轨离合器 ×5 ---------- */
+  const P5={x0:912,y0:BODY.y0,x1:1090,y1:BODY.y1};bay(P5.x0,P5.y0,P5.x1,P5.y1);
+  label(1,P5.x0+12,P5.y0+18,'伪分轨离合器 stems[ ]',14,C.ink,'left');
+  ctx.strokeStyle=C.frame;ctx.lineWidth=3;rod(P5.x0+24,P5.y0+30,P5.x0+24,P5.y1-14,C.frame,3);
+  if(!f.stems||!f.stems.length)label(2,P5.x0+34,P5.y0+60,'stems 未分析：本曲无分轨数据',13.5,C.amber,'left');
+  else{const step=(P5.y1-P5.y0-56)/f.stems.length;
+    for(let s=0;s<f.stems.length;s++){const st=f.stems[s],yy=P5.y0+38+step*(s+0.5);
+      const dead=st.dead,ev=(st.env&&!dead)?st.env[Math.min(i,st.env.length-1)]/255:0;
+      const ang=st.cum&&!dead?st.cum[Math.min(i,st.cum.length-1)]*(2*Math.PI/50):0;
+      ctx.strokeStyle=dead?C.amber:RAMP[s%6];ctx.lineWidth=2.6;
+      const gap=dead?0.25:0.35+0.6*ev;
+      ctx.beginPath();ctx.arc(P5.x0+46,yy,20,ang,ang+Math.PI*gap);ctx.stroke();
+      ctx.beginPath();ctx.arc(P5.x0+46,yy,20,ang+Math.PI,ang+Math.PI*(1+gap));ctx.stroke();
+      ctx.strokeStyle=C.faint;ctx.lineWidth=1.2;rod(P5.x0+24,yy,P5.x0+26,yy,C.faint,1.2);
+      arbor(P5.x0+46,yy,4);
+      LG.block(P5.x0+22,yy-24,P5.x0+70,yy+24);
+      lab(2,P5.x0+76,yy-14,[String(st.label||st.id||'轨'+s).split('(')[0].trim(),String(st.id||'轨'+s)],
+        96,13.5,dead?C.amber:C.ink,'left');
+      lab(3,P5.x0+76,yy+2,[dead?'死通道·已脱开':'env '+nz(ev,2),dead?'已脱开':'env '+nz(ev,2)],96,13.5,dead?C.amber:C.mid,'left');
+      lab(3,P5.x0+76,yy+18,[st.band_hz?(st.kind==='hpss+band'?'带 ':'')+hzRange(st.band_hz[0],st.band_hz[1]):'HPSS 全频',
+        st.band_hz?hzRange(st.band_hz[0],st.band_hz[1]):'全频',st.kind||''],96,13.5,C.dim,'left');}}
+
+  /* ---------- 机位 6：绝对量铭牌 ---------- */
+  const P6={x0:1096,y0:BODY.y0,x1:1204,y1:BODY.y1};bay(P6.x0,P6.y0,P6.x1,P6.y1);
+  label(1,P6.x0+10,P6.y0+18,'绝对量铭牌',14,C.ink,'left');
+  const m=f.meter||{};
+  const rows=[['总响度LUFS',nz(m.lufs_integrated,2)],['rms',nz(m.rms_dbfs,2)],['crest',nz(m.crest_db,2)],
+   ['peak',nz(m.sample_peak_dbfs,2)],['声道相关',nz(m.stereo_corr,3)],['S/M 侧中比',nz(m.side_mid_ratio,3)],
+   ['帧LUFS',f.lufs&&i<f.lufs.length?nz(f.lufs[i],1):'未提供'],
+   ['调性',(f.key&&f.key.name)?txt(f.key.name):'不可定'],
+   ['调性相关',nz(f.key?f.key.corr:NaN,2)],
+   ['起音率',nz(f.raw.mood?f.raw.mood.onset_rate_per_s:NaN,2)+'/s']];
+  rows.forEach((rw,k)=>{const yy=P6.y0+40+k*46;
+    lab(2,P6.x0+10,yy,[rw[0]],88,13.5,C.dim,'left');
+    lab(2,P6.x1-10,yy+19,[rw[1]],88,13.5,(k===7&&!(f.key&&f.key.name))?C.amber:C.ink,'right');});
+  lab(3,P6.x0+10,P6.y1-40,['分析器自证'],88,13.5,C.dim,'left');
+  lab(3,P6.x1-10,P6.y1-21,[f.raw.verify?'verify '+nz(f.raw.verify.elapsed_s,1)+'s':'未提供',
+    f.raw.verify?nz(f.raw.verify.elapsed_s,1)+'s':'未提供'],88,13.5,C.hi,'right');
+
+  /* ---------- 底栏：能量守恒横条 ---------- */
+  const BB={x0:40,x1:846,y0:FOOT.y0+14,h:26};
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.6;ctx.strokeRect(BB.x0,BB.y0,BB.x1-BB.x0,BB.h);
+  if(f.official){let xacc=BB.x0;
+    for(let k=0;k<nG;k++){const wk=(f.groups[k].i1-f.groups[k].i0)/96;
+      const share=(g[k]*wk)/(total||1e-9);const ww=(BB.x1-BB.x0)*Math.max(0,Math.min(1,share));
+      ctx.fillStyle=RAMP[k%6];ctx.globalAlpha=0.85;ctx.fillRect(xacc,BB.y0+2,ww,BB.h-4);ctx.globalAlpha=1;
+      if(ww>40)label(3,xacc+ww/2,BB.y0+BB.h/2,String(k+1),13.5,C.ink,'center');
+      xacc+=ww;}
+    label(1,BB.x0,BB.y0-4,'能量守恒横条 份额 = g×带宽占比',14,C.ink,'left');
+    lab(1,BB.x1+10,BB.y0+6,['Σ '+nz(total,3)+' ≡ Σg '+nz(wsum,3)+' 残差 '+nz(total-wsum,4),
+      'Σ '+nz(total,3)+' ≡ Σg '+nz(wsum,3),'Σ≡Σg 残差 '+nz(total-wsum,4)],350,13.5,C.hi,'left');
+    label(1,BB.x1+10,BB.y0+24,'账面闭合：无凭空增益',13.5,C.dim,'left');}
+  else{label(1,(BB.x0+BB.x1)/2,BB.y0+BB.h/2,'账面不可闭合：bands.groups 未下发，无分组占比可算',14,C.amber,'center',{fixed:true,must:true});
+    label(1,BB.x0,BB.y0-4,'能量守恒横条',14,C.ink,'left');
+    label(1,BB.x1+10,BB.y0+6,'Σ '+nz(total,3),13.5,C.hi,'left');}
+  const nDead=f.stems?f.stems.filter(s=>s.dead).length:0;
+  if(nDead)label(2,BB.x1+10,BB.y0+24,'死通道 '+nDead+' 条已脱开',13.5,C.amber,'left');
+
+  LG.flush();
+  window.__SELFTEST__.groups_official=f.official?1:0;
+  window.__SELFTEST__.dead_clutches=f.stems?f.stems.filter(s=>s.dead).length:0;
+  window.__SELFTEST__.n_groups=nG;
+  updatePanel(i,g,total,wsum,rmsV,flaV,cenV,ten,kick,jit);
+}
+
+/* ================= 面板（与画面同帧） ================= */
+const FIELDS=[['主飞轮角速度','∫Σ(bands 96 带均值)','S'],['组 0..5 齿轮','bands.groups 各组均值','g'],
+ ['曲柄活塞','最低组帧间差分→节拍冲量','kick'],['散热风扇','最高组积分','fan'],
+ ['散热片 12 齿','最高组末 12 带','fin'],['调速器','curves.tension / Σ','ten'],
+ ['压力表','curves.rms（归一）','rms'],['阻尼表','curves.flatness（归一）','fla'],
+ ['质心表','curves.cent × curves_hz.cent_max','cen'],['抖动','curves.flux[i]−flux[i−6]','jit'],
+ ['离合器 5 条','stems[k].env_b64[i]（dead→脱开）','st']];
+function buildTable(){const tb=el('fields');tb.innerHTML='';
+  for(const r of FIELDS){const tr=document.createElement('tr');
+    tr.innerHTML='<td class="m">'+r[0]+'</td><td class="f">'+r[1]+'</td><td class="v" data-k="'+r[2]+'">—</td>';tb.appendChild(tr);}
+  const lg=el('ledger');lg.innerHTML='';
+  const rows=[['Σ 96带均值','tot']];
+  for(let k=0;k<M.f.nG;k++)rows.push(['g'+k+' '+(M.f.groups[k].name||''),'w'+k]);
+  rows.push(['残差 Σ−Σg','res']);
+  for(const r of rows){const tr=document.createElement('tr');
+    tr.innerHTML='<td class="m">'+r[0]+'</td><td class="v" data-led="'+r[1]+'">—</td>';lg.appendChild(tr);}
+  const pl=el('plate');const m=M.f.raw.meter||{};
+  const rows2=[['lufs_integrated（绝对 LUFS）',nz(m.lufs_integrated,2)],['rms_dbfs（绝对 dBFS）',nz(m.rms_dbfs,2)],
+   ['sample_peak_dbfs（绝对）',nz(m.sample_peak_dbfs,2)],['crest_db（绝对）',nz(m.crest_db,2)],
+   ['stereo_corr / side_mid_ratio',nz(m.stereo_corr,3)+' / '+nz(m.side_mid_ratio,3)],
+   ['lufs_frame_b64 换算','v/255*60−60（'+txt((m.lufs_frame_range||[]).join('~'))+'）'],
+   ['source.fps / frames / duration',(M.f.raw.source.fps||30)+' / '+M.f.fr+' / '+nz(M.f.dur,1)+'s'],
+   ['bands.norm（归一方式）',txt(M.f.raw.bands.norm)],
+   ['bands.groups（官方分组）',M.f.official?M.f.nG+' 组':'未下发'],
+   ['key / mode（可空）',(M.f.key&&M.f.key.name)?(txt(M.f.key.name)+' '+txt(M.f.key.mode)+' corr='+nz(M.f.key.corr,2)):('调性不可定 corr='+nz(M.f.key?M.f.key.corr:NaN,2))]];
+  pl.innerHTML='';for(const r of rows2){const tr=document.createElement('tr');
+    tr.innerHTML='<td class="m">'+r[0]+'</td><td class="v">'+r[1]+'</td>';pl.appendChild(tr);}}
+function setv(sel,v){const n=document.querySelector(sel);if(n)n.textContent=v;}
+function updatePanel(i,g,total,wsum,rms,fla,cen,ten,kick,jit){
+  const f=M.f,v=x=>Number.isFinite(x)?x.toFixed(3):'无信号';
+  setv('[data-k="S"]',v(total));
+  const gt=[];for(let k=0;k<f.nG;k++)gt.push(nz(g[k],3));
+  setv('[data-k="g"]',gt.join(' '));
+  setv('[data-k="kick"]',v(kick));setv('[data-k="ten"]',v(ten));setv('[data-k="rms"]',v(rms));
+  setv('[data-k="fla"]',v(fla));
+  setv('[data-k="cen"]',Number.isFinite(cen)?(nz(cen,3)+'→'+nz(cen*f.centMax,0)+'Hz'):'无信号');
+  setv('[data-k="jit"]',v(jit));
+  setv('[data-k="fan"]',f.official?v(f.gmean[i*f.nG+f.nG-1]):'分组未下发');
+  setv('[data-k="fin"]',f.official?('带'+(f.groups[f.nG-1].i1-12)+'..'+f.groups[f.nG-1].i1):'—');
+  setv('[data-k="st"]',f.stems?f.stems.map(s=>s.dead?'脱开':nz((s.env?s.env[Math.min(i,s.env.length-1)]:0)/255,2)).join(' '):'未分析');
+  setv('[data-led="tot"]',v(total));
+  let sum6=0;for(let k=0;k<f.nG;k++){const wk=(f.groups[k].i1-f.groups[k].i0)/96;sum6+=g[k]*wk;
+    setv('[data-led="w'+k+'"]',v(g[k]*wk));}
+  setv('[data-led="res"]',v(total-sum6));
+  /* 来源行与分段账面高亮：与画面同一个 rAF 帧写入 */
+  el('srcLine').textContent=srcLineText();
+  if(M.secsEff&&M.secsEff.length){let hi=-1;
+    for(let k=0;k<M.secsEff.length;k++)if(M.t>=M.secsEff[k].start&&M.t<M.secsEff[k].end){hi=k;break;}
+    if(hi!==M.secHi){M.secHi=hi;
+      [...el('secLedg').children].forEach((tr,k)=>{tr.style.background=k===hi?'#1d2530':'';});}}
+  el('tRead').textContent=M.t.toFixed(2)+'s';
+  el('scrub').value=Math.round(M.t/f.dur*1000);
+  const s=window.__SELFTEST__||{};
+  el('ledBox').textContent='相交（须为0）='+(s.label_collisions===undefined?'—':s.label_collisions)+
+    ' · 登记='+(s.label_checked===undefined?'—':s.label_checked)+
+    ' 落笔='+(s.label_drawn===undefined?'—':s.label_drawn)+
+    ' 省略='+(s.label_dropped===undefined?'—':s.label_dropped)+
+    ' 挪位='+(s.label_relocated===undefined?'—':s.label_relocated)+
+    ' 缩号='+(s.label_shrunk===undefined?'—':s.label_shrunk)+
+    ' · 探测相交='+(s.label_overlap_events===undefined?'—':s.label_overlap_events)+
+    ' · 禁画区='+(s.geom_kepts===undefined?'—':s.geom_kepts)+
+    ' · 自证相交='+(s.ledger_detect_synth===undefined?'—':s.ledger_detect_synth)+'/'+(s.ledger_e2e_forced===undefined?'—':s.ledger_e2e_forced)+'('+s.ledger_selftest_ok+')'+
+    ' · 实际字高='+(s.min_rendered_font_px===undefined?'—':s.min_rendered_font_px)+'px'+' · 省略号='+(s.label_ellipsis===undefined?'—':s.label_ellipsis)+' · 最小字号='+(s.min_drawn_font_px===undefined?'—':s.min_drawn_font_px)+'px';
+}
+/* ================= 空态 / 走带 / 装载 ================= */
+function renderIdle(){LG.reset({x0:30,y0:30,x1:L.W-30,y1:L.H-26});
+  ctx.fillStyle=C.bg;ctx.fillRect(0,0,L.W,L.H);
+  chassis('A · 频谱传动引擎','色表：琥珀=未确认/降级 · 红=非倍半音真分歧');
+  label(0,L.W/2,300,'机器静止：等待数据。所有角度都是 bands/curves 的积分，本页零网络、零内置音频、零墙钟动画。',15,C.mid,'center',{fixed:true,must:true});
+  label(0,L.W/2,330,'拖入 *.features.json → 机组按数据走带；拖入音频（可选）→ 仅作走带时钟与监听。',14,C.dim,'center',{fixed:true,must:true});
+  LG.flush();}
+function loop(now){window.__raf=(window.__raf|0)+1;
+  if(!loop.last)loop.last=now;const dt=Math.min(0.05,(now-loop.last)/1000);loop.last=now;
+  if(M.f){if(audioEl&&!audioEl.paused&&M.dir>0)M.t=audioEl.currentTime;
+    else if(M.playing){M.t+=dt*M.speed*M.dir;if(M.t<0){M.t=0;M.dir=1;}if(M.t>M.f.dur)M.t=0;}
+    render(M.t);}else renderIdle();
+  requestAnimationFrame(loop);}
+function afterLoad(){
+  el('bData').textContent='数据：'+M.f.name;el('bData').className='badge ok';
+  el('bSong').textContent='曲目：'+txt(M.f.raw.source.name);
+  el('bGroups').textContent='分组：'+(M.f.official?('bands.groups 官方 '+M.f.nG+' 组'):'未下发（降级）');
+  el('bGroups').className='badge '+(M.f.official?'ok':'warn');
+  el('bStems').textContent=M.f.stems?('分轨：'+M.f.stems.length+' 条（频带近似）'):'分轨：未分析';
+  el('bStems').className='badge '+(M.f.stems?'ok':'warn');
+  /* 顶栏必须一眼看出"这台降级了"：盲读评审两次指出降级态与正常态版式一致、画面里没有"降级"二字 */
+  const sig=M.f.rhythm?M.f.rhythm.grid_significant:null;
+  const deadN=M.f.stems?M.f.stems.filter(s=>s.dead).length:0;
+  el('bGrid').textContent='网格：'+(sig===false?'不可信（已降级）':(sig===true?'可信':'未提供'))+
+    (deadN?(' · 死轨 '+deadN+'/'+M.f.stems.length):'');
+  el('bGrid').className='badge '+((sig===false||deadN||M.f.official===false)?'warn':'ok');
+  const vf=M.f.raw.verify;
+  el('verifyBox').textContent=vf?('elapsed '+nz(vf.elapsed_s,1)+'s · checks '+(vf.checks||[]).filter(c=>c.ok).length+'/'+(vf.checks||[]).length+(vf.checks||[]).every(c=>c.ok)?' 全过':' 有未过项'):'verify 未提供';
+  buildTable();M.playing=true;M.t=0;el('btnPlay').textContent='⏸ 走带';}
+function loadFeatText(s){try{const F=JSON.parse(s);decode(F);M.err='';afterLoad();}
+  catch(e){M.err=String(e.message||e);el('bData').textContent='数据：'+txt(M.err);el('bData').className='badge warn';
+    el('verifyBox').textContent='读取失败：'+txt(M.err);}}
+async function takeFeatFile(fl){clearBundle();
+  try{loadFeatText(await fl.text());el('dzFeat').innerHTML='✔ 已装载 '+fl.name+'（可换）';}
+  catch(e){el('dzFeat').innerHTML='✘ 读取失败';}}
+async function takeAudioFile(fl){audioEl=audioEl||new Audio();audioEl.src=URL.createObjectURL(fl);
+  el('bAudio').textContent='音频：'+noell(fl.name);el('bAudio').className='badge ok';
+  /* 自动播放被拦住时不许装成有声：徽章转警告，点画面任意处即出声 */
+  audioEl.play().catch(()=>{el('bAudio').textContent='音频：被浏览器拦住 · 点画面出声';
+    el('bAudio').className='badge warn';
+    document.addEventListener('pointerdown',()=>{audioEl&&audioEl.play().catch(()=>{});},{once:true});});
+  el('dzAudio').innerHTML='✔ 走带时钟 ← '+fl.name+'（仅作时间源/监听，不做分析）';}
+el('dzFeat').addEventListener('click',()=>el('fpFeat').click());
+el('fpFeat').addEventListener('change',()=>{if(el('fpFeat').files[0])takeFeatFile(el('fpFeat').files[0]);});
+el('dzAudio').addEventListener('click',()=>el('fpAudio').click());
+el('fpAudio').addEventListener('change',()=>{if(el('fpAudio').files[0])takeAudioFile(el('fpAudio').files[0]);});
+document.addEventListener('dragover',e=>{e.preventDefault();el('dropAll').classList.add('on');});
+document.addEventListener('dragleave',()=>el('dropAll').classList.remove('on'));
+document.addEventListener('drop',async e=>{e.preventDefault();el('dropAll').classList.remove('on');
+  for(const fl of e.dataTransfer.files){
+    if(/\.json$/i.test(fl.name))await takeFeatFile(fl);
+    else if(fl.type.startsWith('audio')||/\.(mp3|wav|ogg|flac|m4a)$/i.test(fl.name))await takeAudioFile(fl);}});
+el('btnPlay').addEventListener('click',()=>{M.playing=!M.playing;el('btnPlay').textContent=M.playing?'⏸ 走带':'▶ 走带';
+  if(audioEl){M.playing?audioEl.play().catch(()=>{}):audioEl.pause();}});
+el('btnRev').addEventListener('click',()=>{M.dir*=-1;el('btnRev').className=M.dir<0?'sel':'';if(audioEl&&M.dir<0)audioEl.pause();});
+el('btnReset').addEventListener('click',()=>{M.t=0;});
+el('scrub').addEventListener('input',e=>{if(M.f){M.playing=false;el('btnPlay').textContent='▶ 走带';M.t=e.target.value/1000*M.f.dur;if(audioEl)audioEl.pause();}});
+el('spdBox').addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;M.speed=parseFloat(b.dataset.s);
+  [...el('spdBox').children].forEach(x=>x.className='');b.className='sel';});
+/* ============ 标注台交付包接收端（CONTRACT §5）：启动即监听，收到前一切照旧 ============ */
+const DEVICE_ID='A';
+window.__BUNDLE__={received:false,ack_sent:false,project:null,bpm:null,bpm_source:null,human_bpm:false,
+  sec_mode:null,driven_bounds:[],suggestion_bounds:[],sketch_strokes:0,error:'',human_regions:[],sugg_regions:[]};
+const BUNDLE=window.__BUNDLE__;
+const isHumanRegion=r=>!!r&&(r.confirmed===true||r.auto===false);
+/* regions → 段对象：边界=人工结论；段内读数取与 features.sections 重叠时长的加权均值（只用契约字段） */
+function regionSections(regs,F){
+  const st=(F&&F.structure&&F.structure.sections)||[];
+  return regs.slice().sort((a,b)=>a.t0-b.t0).map(r=>{
+    const s={start:+r.t0||0,end:+r.t1||0,name:r.name||'',sketch:(r.sketch||[]).slice()};
+    let w=0;const acc={};for(const k of ['energy','bright','tension','noise','lowhigh','onset_per_s','novelty'])acc[k]=0;
+    for(const sc of st){const a=Math.max(s.start,sc.start),b=Math.min(s.end,sc.end);
+      if(b<=a)continue;w+=b-a;
+      for(const k in acc)if(Number.isFinite(sc[k]))acc[k]+=(b-a)*sc[k];}
+    if(w>0)for(const k in acc)s[k]=acc[k]/w;
+    s.bars=null;return s;});}
+function effSections(){ /* regions 优先；无人工段退回 sections 并标注"未经人工确认" */
+  if(!M.f||!M.f.raw)return [];
+  if(BUNDLE.human_regions.length){BUNDLE.sec_mode='regions';return regionSections(BUNDLE.human_regions,M.f.raw);}
+  BUNDLE.sec_mode='sections-fallback';
+  return (M.f.raw.structure&&M.f.raw.structure.sections)||[];}
+function rowMean(a,b){const f=M.f;if(!f)return NaN;let s=0,n=0;
+  const i0=Math.max(0,Math.floor(a*f.fps)),i1=Math.min(f.fr,Math.ceil(b*f.fps));
+  for(let i=i0;i<i1;i++){s+=f.rowG[i];n++;}return n?s/n:NaN;}
+function buildSecLedger(secs){
+  const tb=el('secLedg');tb.innerHTML='';M.secsEff=secs;M.secHi=-1;
+  el('hSecLedg').style.display=secs.length?'':'none';
+  secs.forEach((s,k)=>{const tr=document.createElement('tr');
+    tr.innerHTML='<td class="m">段'+(k+1)+(s.name?'·'+noell(String(s.name)):'')+'</td>'+
+      '<td class="f">'+nz(s.start,1)+'–'+nz(s.end,1)+'s '+(BUNDLE.sec_mode==='regions'?'人工段':'自动')+'</td>'+
+      '<td class="v">'+nz(rowMean(s.start,s.end),3)+'</td>';tb.appendChild(tr);});}
+function bundleDriven(){ /* A 的段落级机构 = 分段账面：吃 regions 优先的有效段 */
+  const secs=effSections();
+  BUNDLE.driven_bounds=secs.map(s=>[s.start,s.end]);
+  BUNDLE.sketch_strokes=secs.reduce((n,s)=>n+((s.sketch&&s.sketch.length)||0),0);
+  buildSecLedger(secs);}
+function srcLineText(){
+  return BUNDLE.received?('来自标注台 · '+noell(String(BUNDLE.project))+
+    ' · 拍速 '+(Number.isFinite(BUNDLE.bpm)?nz(BUNDLE.bpm,1):'未提供')+'（'+noell(String(BUNDLE.bpm_source))+'）'+
+    (BUNDLE.sec_mode==='sections-fallback'?' · 按自动分段（未经人工确认）':'')):'数据源：未载入';}
+function clearBundle(){ /* 用户重新拖文件 = 数据源切回本地，交付包状态作废 */
+  BUNDLE.received=false;BUNDLE.sec_mode=null;BUNDLE.driven_bounds=[];BUNDLE.suggestion_bounds=[];
+  BUNDLE.human_regions=[];BUNDLE.sugg_regions=[];BUNDLE.sketch_strokes=0;BUNDLE.human_bpm=false;BUNDLE.error='';
+  M.secsEff=null;el('secLedg').innerHTML='';el('hSecLedg').style.display='none';}
+function applyBundle(b){
+  BUNDLE.received=true;BUNDLE.error='';
+  const pr=b.project||{};
+  BUNDLE.project=pr.name||'未命名';
+  BUNDLE.bpm=Number.isFinite(pr.bpm)?pr.bpm:null;
+  BUNDLE.bpm_source=pr.bpm_source||'自动';
+  BUNDLE.human_bpm=/^人工/.test(String(BUNDLE.bpm_source));
+  const regs=Array.isArray(b.regions)?b.regions.filter(r=>r&&Number.isFinite(+r.t0)&&Number.isFinite(+r.t1)):[];
+  BUNDLE.human_regions=regs.filter(isHumanRegion);
+  BUNDLE.sugg_regions=regs.filter(r=>!isHumanRegion(r));
+  BUNDLE.suggestion_bounds=BUNDLE.sugg_regions.map(r=>[+r.t0,+r.t1]);
+  loadFeatText(JSON.stringify(b.features||{}));   /* 与拖文件完全同一条处理路径 */
+  if(M.f)bundleDriven();}
+window.addEventListener('message',ev=>{const d=ev&&ev.data;
+  /* 标注台「送进装置」会把声音单独跟一条消息（bundle 只带数据不带歌） */
+  if(d&&d.kind==='annotator-audio'){if(d.buf){try{takeAudioFile(new File([d.buf],d.name||'来自标注台',{type:d.type}));}catch(e){}}return;}
+  if(!d||d.kind!=='annotator-bundle')return;
+  try{applyBundle(d);}catch(e){BUNDLE.error=String((e&&e.message)||e);}
+  if(ev.source){try{ev.source.postMessage({kind:'annotator-bundle-ack',device:DEVICE_ID},'*');
+    BUNDLE.ack_sent=true;}catch(e){BUNDLE.error=(BUNDLE.error?BUNDLE.error+' ':'')+'ack失败';}}});
+window.__M={
+  injectFeatText(s){loadFeatText(s);},
+  bundleState(){return window.__BUNDLE__;},
+  setTime(t){M.playing=false;if(audioEl)audioEl.pause();M.t=t;render(t);},
+  state(){return{t:M.t,dur:M.f?M.f.dur:0,frames:M.f?M.f.fr:0,fps:M.f?M.f.fps:0,raf:window.__raf|0};},
+  selftest(){return window.__SELFTEST__;},
+  snap(w,h){w=w||158;h=h||96;const c2=document.createElement('canvas');c2.width=w;c2.height=h;
+    const g=c2.getContext('2d');g.fillStyle='#000';g.fillRect(0,0,w,h);g.drawImage(cv,0,0,w,h);
+    const d=g.getImageData(0,0,w,h).data;const out=new Uint8Array(w*h);
+    for(let i=0,j=0;i<d.length;i+=4,j++)out[j]=(d[i]*77+d[i+1]*151+d[i+2]*28)>>8;return out.join(',');}};
+window.__SELFTEST__={device:'A-频谱传动引擎',label_collisions:null};
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

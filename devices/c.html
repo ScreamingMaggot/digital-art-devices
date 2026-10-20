@@ -1,0 +1,967 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>C · 舞台优先 · 地层档案压机</title>
+<style>
+:root{--bg:#070a0d;--ink:#dfe6ee;--dim:#8fa0b3;--amber:#ffb24d;--line:#2b333c}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+  font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;overflow:hidden}
+#stage{position:fixed;inset:0;width:100%;height:100%;display:block}
+#dock{position:fixed;left:50%;bottom:4px;transform:translateX(-50%);display:flex;align-items:center;gap:6px;
+  padding:3px 8px;border:1px solid #2b333c;border-radius:4px;background:rgba(9,12,16,.94);
+  font-size:12px;color:#93a5b8;white-space:nowrap;z-index:5}
+#dock button{font:inherit;font-size:12px;background:#141a20;color:#c3d0dd;border:1px solid #2b333c;border-radius:3px;
+  padding:2px 8px;cursor:pointer;line-height:1.35}
+#dock button:hover{border-color:#4a5665}
+#dock button.sel{border-color:#ffb24d;color:#ffb24d}
+#dock input[type=range]{width:180px;height:12px}
+#dock .tc{font-family:Consolas,monospace;color:#dfe6ee;font-size:12px}
+#dropAll{position:fixed;inset:0;pointer-events:none;border:2px solid transparent;z-index:9}
+#dropAll.on{border-color:#ffb24d}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="hud" style="display:none;position:fixed;left:0;right:0;top:0;z-index:10;height:34px;line-height:34px;padding:0 14px;background:#070a0d;border-bottom:1px solid #2b333c;font-size:14px;color:#ffb24d"></div>
+<div id="srcLine" style="display:none;position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)">数据源：未载入</div>
+<div id="dock">
+  <button id="btnPlay">▶ 走带</button>
+  <button id="btnReset">⟲ 归零</button>
+  <button id="btnRev">反转</button>
+  <input type="range" id="scrub" min="0" max="1000" value="0">
+  <span class="tc" id="tRead">0.00s</span>
+  <button id="btnFeat">features</button>
+  <button id="btnAudio">音频</button>
+</div>
+<input type="file" id="fpFeat" hidden accept=".json">
+<input type="file" id="fpAudio" hidden accept="audio/*">
+<div id="dropAll"></div>
+<script>
+"use strict";
+/* ============================================================================
+   C · 地层档案压机 — 舞台优先重排
+   病灶（已实测）：现役 C 是仪表盘 —— 纸带只有 388×206 逻辑 px，左右两块读数板
+   各占 264/492 px 宽，画面主体面积落到 4%，audit 的 subject 判据 4.2%/2.1% 直接判死。
+   本件把同一批字段/语义原样搬进一个占画幅 77.3% 的压机舞台：
+     舞台 = 纸带（沉积层 + 细纹层）+ 压印头 + 送纸辊 + 照光带 + 时间尺
+     读数 = 顶 96px / 底 108px 两条窄带 + 舞台两侧 4 枚悬浮 HUD（最小字号 14 逻辑 px）
+   不删信息，只重排：层账本、novelty、verify、chroma/key、时间尺、段实读、字段口径
+   全部保留，位置从"面板"改为"仪表的注脚"。
+   ---------------------------------------------------------------------------
+   色义（与 C 同表）：琥珀=未确认/降级/仅归一；红=非倍半音真分歧（本机无该判定，不出现）；
+   其余中性冷色。层色语义不变：明度=bright · 不透明度=energy · 点画=noise ·
+   左缘刻度=onset_per_s · 暗裂纹=tension。
+   画面 = f(features, t)：无墙钟动画、无随机数；走带 t 只是输入口。
+   ========================================================================== */
+const C={bg:'#070a0d',ink:'#dfe6ee',hi:'#c3d0dd',mid:'#93a5b8',dim:'#6d7f92',faint:'#4a5665',
+  frame:'#39434f',plate:'#0b1015',plateEd:'#2b333c',amber:'#ffb24d',red:'#ff7b6e',
+  ink0:'#12171d',ink1:'#1a2129',paperHi:'#c6cfda',paperLo:'#96a0ae'};
+const FONT='Consolas,"Microsoft YaHei",monospace';
+const MINFONT=14;                 /* 逻辑字号下限：1280×720 时 letterbox 缩放 0.8 → 实际 11.2px ≥11 */
+const L={W:1600,H:900};
+/* ---- 版面：舞台 96..792（696/900 = 77.3%），读数带只占顶 96 + 底 108 ---- */
+const TOP={y0:0,y1:96},BOT={y0:792,y1:900};
+const STAGE={x0:0,y0:TOP.y1,x1:L.W,y1:BOT.y0};
+const TP={x0:330,y0:250,x1:1270,y1:676};      /* 纸带：940×426 = 画幅 27.8% */
+const WL={x0:88,x1:318},WR={x0:1322,x1:1514}; /* 左右悬浮 HUD（仪表） */
+const SCALE=13;                                /* px / 行程单位：满 rms 约 160 px/s 连续走带 */
+const LEVELS=[1330,1376,1422,1468];                 /* k 切层杆 4 枚（右翼底部） */
+const LEVY=[652,672];
+let audioEl=null;
+const cv=document.getElementById('stage'),ctx=cv.getContext('2d');
+window.__BUNDLE__={received:false,ack_sent:false,project:null,bpm:null,bpm_source:null,human_bpm:false,
+  sec_mode:null,driven_bounds:[],suggestion_bounds:[],sketch_strokes:0,error:'',human_regions:[],sugg_regions:[]};
+const BUNDLE=window.__BUNDLE__;
+const M={t:0,playing:false,dir:1,speed:1,f:null,ghostK:null,inks:[],err:''};
+const el=id=>document.getElementById(id);
+const b64u8=s=>{const b=atob(s),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;};
+const nz=(v,d)=>Number.isFinite(v)?v.toFixed(d):'未分析';
+const num=(v,d)=>Number.isFinite(v)?v:d;      /* 契约 §5.2：不许写 (v||默认) */
+const clamp01=v=>v<0?0:v>1?1:v;
+const noell=s=>String(s).replace(/…/g,'·').replace(/\.\.\./g,'·');
+const txt=v=>(v==null||v===''||v===undefined)?'未提供':noell(v);
+const hash=n=>{n=Math.imul(n^(n>>>15),2246822507);n^=n>>>13;return (n>>>0)/4294967296;};
+
+function fitCanvas(){const r=cv.getBoundingClientRect(),d=Math.min(window.devicePixelRatio||1,2);
+  cv.width=Math.max(2,Math.round(r.width*d));cv.height=Math.max(2,Math.round(r.height*d));
+  const s=Math.min(cv.width/L.W,cv.height/L.H);
+  const ox=(cv.width-L.W*s)/2, oy=(cv.height-L.H*s)/2;
+  ctx.setTransform(s,0,0,s,ox,oy);window.__scale=s;window.__tf={s:s,ox:ox,oy:oy,dpr:d};}
+new ResizeObserver(fitCanvas).observe(cv);
+
+/* ================= 标签占位账本 label ledger（与 A/B/C/D/H3 同一实现） =================
+   任何 fillText 都经 LG.add 排队 → LG.flush 落笔；落笔前与已登记文字盒求交；
+   相交 → 挪位（8 方向×4 档）→ 缩字号（≥MINFONT）→ 仍无解则整条省略（绝不截断加省略号）。
+   label_collisions = 真的相交还落笔的次数，必须为 0。                         */
+let LEDGER_PROBE={detected:0,clean:0,e2e:0,ok:false};
+const LG={
+  occ:[],q:[],st:null,bounds:{x0:0,y0:0,x1:L.W,y1:L.H},
+  reset(b){this.occ=[];this.q=[];this.bounds=b||{x0:0,y0:0,x1:L.W,y1:L.H};
+    this.st={checked:0,drawn:0,dropped:0,relocated:0,shrunk:0,collisions:0,overlap_events:0,geom:0,
+      ellipsis:0,nan:0,minfont:999,drop_detail:[]};},
+  hit(a,b){return a.x0<b.x1&&b.x0<a.x1&&a.y0<b.y1&&b.y0<a.y1;},
+  block(x0,y0,x1,y1){this.occ.push({x0,y0,x1,y1,g:1});this.st.geom++;},
+  overlaps(r){let n=0;for(let k=0;k<this.occ.length;k++)if(this.hit(this.occ[k],r))n++;return n;},
+  box(x,y,t,s,align){ctx.save();ctx.font=s+'px '+FONT;const w=ctx.measureText(t).width;ctx.restore();
+    const h=s*1.3,x0=align==='center'?x-w/2:align==='right'?x-w:x;
+    return {x0:x0,y0:y-h/2,x1:x0+w,y1:y+h/2,w:w,h:h};},
+  add(prio,x,y,text,size,col,align,opt){this.q.push({prio:prio,x:x,y:y,text:String(text),
+    size:Math.max(MINFONT,size||MINFONT),col:col||C.mid,align:align||'left',opt:opt||{}});},
+  clamp(r){const b=this.bounds;let dx=0,dy=0;
+    if(r.x0<b.x0)dx=b.x0-r.x0; if(r.x1>b.x1)dx=b.x1-r.x1;
+    if(r.y0<b.y0)dy=b.y0-r.y0; if(r.y1>b.y1)dy=b.y1-r.y1;
+    return {x0:r.x0+dx,y0:r.y0+dy,x1:r.x1+dx,y1:r.y1+dy,w:r.w,h:r.h};},
+  note(s,t){this.st.minfont=Math.min(this.st.minfont,s);
+    if(/…|\.\.\./.test(t))this.st.ellipsis++;
+    if(/NaN|undefined|null|Infinity/.test(t))this.st.nan++;},
+  place(it){this.st.checked++;
+    const sizes=it.opt.noshrink?[it.size]:[it.size,Math.max(MINFONT,it.size*0.9),Math.max(MINFONT,it.size*0.82)];
+    const st=it.size*1.45;let offs=[[0,0]];
+    if(!it.opt.fixed){for(const rad of [1,2,3,5])for(const d of [[0,1],[0,-1],[1,0],[-1,0],[1,1],[-1,1],[1,-1],[-1,-1]])
+      offs.push([d[0]*st*rad*1.1,d[1]*st*rad]);}
+    for(let si=0;si<sizes.length;si++){const s=sizes[si];
+      for(let oi=0;oi<offs.length;oi++){
+        const r=this.clamp(this.box(it.x+offs[oi][0],it.y+offs[oi][1],it.text,s,it.align));
+        const n=this.overlaps(r);
+        if(n===0){if(si>0)this.st.shrunk++;if(oi>0)this.st.relocated++;
+          this.commit(r,it,s);this.occ.push(r);this.st.drawn++;this.note(s,it.text);return true;}
+        this.st.overlap_events+=n;}}
+    if(it.opt.must){const r=this.clamp(this.box(it.x,it.y,it.text,it.size,it.align));
+      this.st.collisions+=this.overlaps(r);this.commit(r,it,it.size);this.occ.push(r);this.st.drawn++;
+      this.note(it.size,it.text);return true;}
+    this.st.dropped++;this.st.drop_list=this.st.drop_list||[];
+    if(this.st.drop_list.length<8)this.st.drop_list.push(it.text);
+    if(this.st.drop_detail.length<8)this.st.drop_detail.push({t:it.text,x:Math.round(it.x),y:Math.round(it.y),why:'overlap'});
+    return false;},
+  commit(r,it,s){if(it.opt.plate){ctx.fillStyle=C.plate;ctx.fillRect(r.x0-3,r.y0-2,r.w+6,r.h+4);
+      ctx.strokeStyle=C.plateEd;ctx.lineWidth=1;ctx.strokeRect(r.x0-3,r.y0-2,r.w+6,r.h+4);}
+    if(it.opt.inkPlate){ctx.fillStyle='rgba(214,221,231,0.90)';ctx.fillRect(r.x0-2,r.y0-1,r.w+4,r.h+2);}
+    ctx.fillStyle=it.col;ctx.font=s+'px '+FONT;ctx.textAlign=it.align;ctx.textBaseline='middle';
+    ctx.fillText(it.text,(it.align==='center')?(r.x0+r.x1)/2:(it.align==='right'?r.x1:r.x0),(r.y0+r.y1)/2);
+    ctx.textAlign='left';ctx.textBaseline='alphabetic';},
+  flush(){this.q.sort((a,b)=>a.prio-b.prio);for(let k=0;k<this.q.length;k++)this.place(this.q[k]);
+    window.__SELFTEST__={device:'C-舞台优先',stage_rect:[STAGE.x0,STAGE.y0,STAGE.x1,STAGE.y1],
+      stage_ratio:+(((STAGE.x1-STAGE.x0)*(STAGE.y1-STAGE.y0))/(L.W*L.H)).toFixed(4),
+      stage_hud_split:{stage_px:STAGE.y1-STAGE.y0,hud_px:L.H-(STAGE.y1-STAGE.y0)},
+      tape_px:[TP.x1-TP.x0,TP.y1-TP.y0],
+      label_collisions:this.st.collisions,label_checked:this.st.checked,
+      label_drawn:this.st.drawn,label_dropped:this.st.dropped,label_relocated:this.st.relocated,
+      label_shrunk:this.st.shrunk,label_overlap_events:this.st.overlap_events,geom_kepts:this.st.geom,
+      label_ellipsis:this.st.ellipsis,nan_labels:this.st.nan,
+      min_drawn_font_px:this.st.drawn?Math.round(this.st.minfont*100)/100:null,
+      label_dropped_text:this.st.drop_list||[],label_dropped_detail:this.st.drop_detail||[],
+      min_font_px:MINFONT,ledger_detect_synth:LEDGER_PROBE.detected,ledger_selftest_ok:LEDGER_PROBE.ok,
+      ledger_e2e_forced:LEDGER_PROBE.e2e,
+      scale_px:Math.round((window.__scale||1)*1000)/1000,
+      min_rendered_font_px:Math.round(MINFONT*(window.__scale||1)*100)/100,
+      sec_mode:window.__BUNDLE__.sec_mode||'',bundle_received:window.__BUNDLE__.received,
+      bundle:(function(b){return{received:b.received,ack_sent:b.ack_sent,sec_mode:b.sec_mode||'',
+        human:b.human_regions.length,sugg:b.sugg_regions.length,
+        driven:b.driven_bounds.map(x=>[x[0],x[1]]),suggestions:b.suggestion_bounds.map(x=>[x[0],x[1]]),
+        sketch_strokes:b.sketch_strokes,error:b.error};})(window.__BUNDLE__)};}
+};
+/* 账本自证（反假绿）：求交原语必须 1/0；端到端"同盒两标签"必须逼出挪位或省略 */
+LEDGER_PROBE=(function(){
+  LG.reset({x0:0,y0:0,x1:L.W,y1:L.H});
+  LG.occ.push(LG.box(120,120,'0000000000',16,'left'));
+  const same=LG.overlaps(LG.box(120,120,'0000000000',16,'left'));
+  const far=LG.overlaps(LG.box(900,500,'0000000000',16,'left'));
+  LG.reset({x0:0,y0:0,x1:L.W,y1:L.H});
+  LG.add(0,120,120,'ZZZZZZZZZZ',16,C.ink,'left');
+  LG.add(0,120,120,'ZZZZZZZZZZ',16,C.ink,'left');
+  LG.flush();
+  const e2e=LG.st.relocated+LG.st.dropped;
+  LG.reset();ctx.clearRect(0,0,L.W,L.H);
+  return {detected:same,clean:far,e2e:e2e,ok:(same===1&&far===0&&e2e>=1)};})();
+function label(prio,x,y,s,size,col,align,opt){LG.add(prio,x,y,s,size,col,align,opt);}
+/* 预置短名选档：pick 取第一条放得下的候选；一条都放不下 → 整条省略（绝不截断加省略号） */
+function pick(cands,maxw,size){ctx.save();ctx.font=(size||MINFONT)+'px '+FONT;let t=null;
+  for(let k=0;k<cands.length;k++){const c=noell(cands[k]);
+    if(ctx.measureText(c).width<=maxw){t=c;break;}}
+  ctx.restore();return t;}
+function lab(prio,x,y,cands,maxw,size,col,align,opt){LG.st.checked++;
+  const t=pick(cands,maxw,size);
+  if(t===null){LG.st.dropped++;LG.st.drop_list=LG.st.drop_list||[];
+    const last=noell(cands[cands.length-1]);
+    if(LG.st.drop_list.length<8&&LG.st.drop_list.indexOf(last)<0)LG.st.drop_list.push(last);
+    if(LG.st.drop_detail.length<8)LG.st.drop_detail.push({t:last,x:Math.round(x),y:Math.round(y),why:'nowidth'});
+    return;}
+  LG.add(prio,x,y,t,size,col,align,opt);}
+
+/* ================= 绘图元件（全部中性冷色） ================= */
+function screw(x,y,r){ctx.strokeStyle=C.faint;ctx.lineWidth=1.2;ctx.beginPath();ctx.arc(x,y,r,0,7);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(x-r*0.7,y);ctx.lineTo(x+r*0.7,y);ctx.stroke();}
+function hairline(x0,y,x1){ctx.strokeStyle='#20272f';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x0,y);ctx.lineTo(x1,y);ctx.stroke();}
+function rod(x0,y0,x1,y1,col,w){ctx.strokeStyle=col||C.mid;ctx.lineWidth=w||3;
+  ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.stroke();}
+function hatch(x,y,w,h,col,gap){ctx.save();ctx.beginPath();ctx.rect(x,y,w,h);ctx.clip();
+  ctx.strokeStyle=col||'#161b21';ctx.lineWidth=1;
+  for(let k=-h;k<w+h;k+=(gap||9)){ctx.beginPath();ctx.moveTo(x+k,y);ctx.lineTo(x+k-h,y+h);ctx.stroke();}ctx.restore();}
+function plate(x0,y0,x1,y1,a){ctx.fillStyle='rgba(9,13,18,'+(a||0.88)+')';ctx.fillRect(x0,y0,x1-x0,y1-y0);
+  ctx.strokeStyle=C.plateEd;ctx.lineWidth=1;ctx.strokeRect(x0+0.5,y0+0.5,x1-x0-1,y1-y0-1);
+  for(const p of [[x0+7,y0+7],[x1-7,y0+7],[x0+7,y1-7],[x1-7,y1-7]])screw(p[0],p[1],2.6);}
+function bracket(x0,y,x1){ctx.strokeStyle='#2b333c';ctx.lineWidth=3;
+  ctx.beginPath();ctx.moveTo(x0,y);ctx.lineTo(x1,y);ctx.stroke();}
+
+/* ================= 解码（与 C 同口径） ================= */
+function decode(F){
+  const src=F.source||{};const fr=src.frames|0,fps=src.fps||30,dur=src.duration||fr/fps;
+  if(!fr)throw new Error('缺 source.frames');
+  const crv={};for(const k of ['rms','onset','flux','cent','rolloff','flatness','lowhigh','tension'])
+    crv[k]=(F.curves&&F.curves[k])?b64u8(F.curves[k]):null;
+  const st=F.structure||{};const secs=st.sections||[];
+  const f={raw:F,fr,fps,dur,crv,secs,nov:st.novelty?Float32Array.from(st.novelty):null,name:src.name||'未知来源',
+    defaultK:st.default_k,method:st.method,sugg:st.suggestions_by_k||{},
+    key:F.key||null,chromaMean:(F.chroma&&F.chroma.mean)||null,mood:F.mood||null,rhythm:F.rhythm||null,
+    stems:Array.isArray(F.stems)?F.stems:null};
+  buildPaper();buildDust();
+  applySections(f,secs);
+  M.f=f;M.ghostK=M.ghostK||String(st.default_k||'6');
+}
+/* 纸带累积行程 P：rate = curves.rms(归一) × (0.25+段energy) —— rms 清零则 P 冻结 */
+function applySections(f,secs){
+  f.secs=secs;
+  f.secOf=new Int16Array(f.fr).fill(-1);
+  for(let j=0;j<f.fr;j++){const tt=j/f.fps;
+    for(let s=0;s<secs.length;s++)if(tt>=secs[s].start&&tt<secs[s].end){f.secOf[j]=s;break;}}
+  f.P=new Float64Array(f.fr+1);
+  for(let j=0;j<f.fr;j++){const rms=f.crv.rms?f.crv.rms[j]/255:0;const s=f.secOf[j];
+    const e=(s>=0&&Number.isFinite(secs[s].energy))?secs[s].energy:0;
+    f.P[j+1]=f.P[j]+rms*(0.25+e);}
+}
+const frameAt=t=>Math.max(0,Math.min(M.f.fr-1,Math.floor(t*M.f.fps+0.5)));
+/* bars 口径：网格不可信时契约给 null → 显示"不可计"（琥珀）；有数字就直接用 */
+function barsText(sec){
+  if(sec==null)return '—';
+  if(sec.bars===null||sec.bars===undefined)return '不可计';
+  if(!Number.isFinite(sec.bars))return '不可计';
+  return String(sec.bars);}
+
+/* ================= 纸纹 / 浮尘（一次性建好，逐帧按 ∫rms 滚动；无随机数） ================= */
+let PAPER=null,DUST=null,PH=0,DH=0;
+function buildPaper(){
+  const w=TP.x1-TP.x0,h=TP.y1-TP.y0;PH=h;
+  const c=document.createElement('canvas');c.width=w;c.height=h;const g=c.getContext('2d');
+  for(let k=0;k<300;k++){
+    const y=hash(k*17+3)*h,x=hash(k*29+7)*w,len=24+hash(k*41+11)*160;
+    g.strokeStyle='rgba(74,84,98,'+(0.03+hash(k*7+5)*0.05).toFixed(3)+')';g.lineWidth=1;
+    g.beginPath();g.moveTo(x,y);
+    g.quadraticCurveTo(x+len*0.5,y+(hash(k*3+1)-0.5)*5,x+len,y+(hash(k*5+2)-0.5)*2);g.stroke();}
+  for(let k=0;k<240;k++){
+    const x=hash(k*13+9)*w,y=hash(k*23+4)*h;
+    g.fillStyle='rgba(56,66,80,'+(0.04+hash(k*31+8)*0.08).toFixed(3)+')';g.fillRect(x,y,1.5,1);}
+  PAPER=c;}
+function buildDust(){
+  const w=1600,h=700;DH=h;
+  const c=document.createElement('canvas');c.width=w;c.height=h;const g=c.getContext('2d');
+  for(let k=0;k<460;k++){
+    const x=hash(k*37+5)*w,y=hash(k*53+9)*h,len=2+hash(k*11+3)*9;
+    g.strokeStyle='rgba(206,220,238,'+(0.03+hash(k*19+7)*0.08).toFixed(3)+')';g.lineWidth=1;
+    g.beginPath();g.moveTo(x,y);g.lineTo(x+len,y+len*0.18);g.stroke();}
+  DUST=c;}
+
+/* ================= 渲染（t 的纯函数） ================= */
+function syncHud(f,gridSig){
+  const h=el('hud');if(!h)return;
+  const msgs=[];
+  if(!f)msgs.push('无数据');
+  else{
+    if(gridSig===false)msgs.push('拍网格不可信');
+    if(!f.secs||!f.secs.length)msgs.push('无分段数据');
+  }
+  if(msgs.length){h.textContent='降级 · '+msgs.join(' · ');h.style.display='block';}
+  else{h.style.display='none';h.textContent='';}
+}
+function render(t){
+  if(!M.f){renderIdle(t);return;}
+  const f=M.f,j=frameAt(t),secs=f.secs;
+  LG.reset({x0:6,y0:6,x1:L.W-6,y1:L.H-6});
+  const gridSig=f.rhythm?f.rhythm.grid_significant===true:null;
+  syncHud(f,gridSig);
+  const sIdx=f.secOf[j],sec=sIdx>=0?secs[sIdx]:null;
+  const Pnow=f.P[j+1],Pmax=f.P[f.fr]||0;
+  const rms=f.crv.rms?f.crv.rms[j]/255:NaN;
+  const rN=Number.isFinite(rms)?clamp01(rms):0;
+  const onC=f.crv.onset?clamp01(f.crv.onset[j]/255):0;
+  const nv=f.nov?(f.nov[j]-(j>4?f.nov[j-4]:f.nov[j])):0;
+  const press=sec&&Number.isFinite(rms)?clamp01(rms*(0.2+sec.energy)):0;
+  const yOf=P=>TP.y0+(Pnow-P)*SCALE;
+  const gs=(f.sugg[M.ghostK]||[]);
+
+  /* ---- 底 + 房间光（位置由 ∫rms 推进，亮度跟 rms/onset；画在面板之下，不碰文字） ---- */
+  ctx.fillStyle=C.bg;ctx.fillRect(0,0,L.W,L.H);
+  const sg=ctx.createLinearGradient(0,STAGE.y0,0,STAGE.y1);
+  sg.addColorStop(0,'#0d1218');sg.addColorStop(0.55,'#0a0f14');sg.addColorStop(1,'#0c1117');
+  ctx.fillStyle=sg;ctx.fillRect(0,STAGE.y0,L.W,STAGE.y1-STAGE.y0);
+  for(const gl of [[0.28,0.30,0.36,'152,176,206'],[0.76,0.64,0.30,'120,140,170']]){
+    const cx=L.W*(gl[0]+0.085*Math.sin(Pnow*0.55+gl[0]*11)),
+          cy=L.H*(gl[1]+0.055*Math.cos(Pnow*0.40+gl[1]*7));
+    const rg=ctx.createRadialGradient(cx,cy,0,cx,cy,L.W*gl[2]);
+    rg.addColorStop(0,'rgba('+gl[3]+','+Math.min(0.26,0.05+0.10*rN+0.07*onC).toFixed(3)+')');
+    rg.addColorStop(1,'rgba('+gl[3]+',0)');
+    ctx.fillStyle=rg;ctx.fillRect(0,0,L.W,L.H);}
+
+  /* ================= 机架（舞台边界） ================= */
+  const FR={x0:18,y0:102,x1:1582,y1:786};
+  ctx.fillStyle='#12171d';ctx.fillRect(FR.x0,FR.y0,FR.x1-FR.x0,32);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.4;ctx.strokeRect(FR.x0+.5,FR.y0+.5,FR.x1-FR.x0-1,31);
+  hatch(FR.x0+2,FR.y0+2,FR.x1-FR.x0-4,28,'#1a2129',16);
+  for(const x of [FR.x0+18,FR.x1-18])screw(x,FR.y0+16,5);
+  ctx.fillStyle='#141a20';ctx.fillRect(FR.x0,134,56,652);ctx.fillRect(FR.x1-56,134,56,652);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.4;
+  ctx.strokeRect(FR.x0+.5,134.5,55,651);ctx.strokeRect(FR.x1-55.5,134.5,55,651);
+  hatch(FR.x0+2,136,52,648,'#1b2229',8);hatch(FR.x1-54,136,52,648,'#1b2229',8);
+  ctx.fillStyle='#12171d';ctx.fillRect(FR.x0,752,FR.x1-FR.x0,34);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.4;ctx.strokeRect(FR.x0+.5,752.5,FR.x1-FR.x0-1,33);
+  hatch(FR.x0+2,754,FR.x1-FR.x0-4,30,'#1a2129',18);
+  for(const x of [FR.x0+40,FR.x1-40])screw(x,769,5);
+
+  /* ---- 压印头：横梁 + 中央液压缸 + 双导柱 + 滑枕（压深←rms×段energy，横振←novelty 差分） ---- */
+  const BEAM={x0:330,y0:142,x1:1270,y1:192};
+  ctx.fillStyle='#1a2129';ctx.fillRect(BEAM.x0,BEAM.y0,BEAM.x1-BEAM.x0,BEAM.y1-BEAM.y0);
+  hatch(BEAM.x0+1,BEAM.y0+1,BEAM.x1-BEAM.x0-2,BEAM.y1-BEAM.y0-2,'#222a33',6);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.8;ctx.strokeRect(BEAM.x0,BEAM.y0,BEAM.x1-BEAM.x0,BEAM.y1-BEAM.y0);
+  ctx.strokeStyle='rgba(210,226,244,0.20)';ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(BEAM.x0+4,BEAM.y0+2);ctx.lineTo(BEAM.x1-4,BEAM.y0+2);ctx.stroke();
+  for(const x of [BEAM.x0+22,BEAM.x1-22])screw(x,167,7);
+  const hx=Math.max(560,Math.min(1040,800+(Number.isFinite(nv)?nv*260:0)));
+  const ramTop=202+press*30,ramW=480,ramH=52;
+  /* 中央液压缸 + 活塞杆：杆长 = 压深 */
+  ctx.fillStyle='#1d252e';ctx.fillRect(hx-58,BEAM.y1,116,Math.max(2,ramTop-BEAM.y1));
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.6;ctx.strokeRect(hx-58,BEAM.y1,116,Math.max(2,ramTop-BEAM.y1));
+  hatch(hx-56,BEAM.y1+1,112,Math.max(1,ramTop-BEAM.y1-2),'#242d37',8);
+  ctx.fillStyle='#93a5b8';ctx.fillRect(hx-14,BEAM.y1,28,Math.max(2,ramTop-BEAM.y1-4));
+  ctx.strokeStyle='rgba(223,232,244,0.55)';ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(hx-11,BEAM.y1+2);ctx.lineTo(hx-11,ramTop-4);ctx.stroke();
+  /* 两侧导柱（跟着横振一起平移） */
+  rod(hx-252,BEAM.y1,hx-252,ramTop+8,C.mid,7);rod(hx+252,BEAM.y1,hx+252,ramTop+8,C.mid,7);
+  ctx.strokeStyle='rgba(223,232,244,0.28)';ctx.lineWidth=1.4;
+  ctx.beginPath();ctx.moveTo(hx-254,BEAM.y1);ctx.lineTo(hx-254,ramTop+6);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(hx+250,BEAM.y1);ctx.lineTo(hx+250,ramTop+6);ctx.stroke();
+  /* 滑枕 + 压印模面 */
+  ctx.fillStyle='#242d37';ctx.strokeStyle=C.hi;ctx.lineWidth=2;
+  ctx.fillRect(hx-ramW/2,ramTop,ramW,ramH);ctx.strokeRect(hx-ramW/2,ramTop,ramW,ramH);
+  ctx.fillStyle='#2c3742';ctx.fillRect(hx-ramW/2+6,ramTop+ramH-12,ramW-12,8);
+  ctx.strokeStyle='#141a20';ctx.lineWidth=1.4;
+  for(let k=1;k<24;k++){const xx=hx-ramW/2+6+k*(ramW-12)/24;
+    ctx.beginPath();ctx.moveTo(xx,ramTop+ramH-12);ctx.lineTo(xx,ramTop+ramH-4);ctx.stroke();}
+  ctx.strokeStyle='#39434f';ctx.lineWidth=1;
+  for(let k=1;k<5;k++){const yy=ramTop+ramH*k/5;ctx.beginPath();ctx.moveTo(hx-ramW/2+10,yy);ctx.lineTo(hx+ramW/2-10,yy);ctx.stroke();}
+  for(const x of [hx-ramW/2+12,hx+ramW/2-12])screw(x,ramTop+10,4);
+  ctx.fillStyle=C.amber;ctx.beginPath();ctx.arc(800,BEAM.y0+15,5,0,7);ctx.fill();
+  /* 压印闪光：只跟 press（= rms×段energy），数据清零即无光 */
+  if(press>0.02){const fg=ctx.createRadialGradient(hx,ramTop+ramH+6,0,hx,ramTop+ramH+6,150);
+    fg.addColorStop(0,'rgba(224,236,252,'+(0.10+0.22*press).toFixed(3)+')');
+    fg.addColorStop(1,'rgba(224,236,252,0)');
+    ctx.fillStyle=fg;ctx.fillRect(hx-160,ramTop+ramH-40,320,180);}
+
+  /* ================= 舞台主体：纸带（沉积层 + 细纹层） ================= */
+  ctx.fillStyle='#0b0f13';ctx.fillRect(TP.x0-6,TP.y0-6,TP.x1-TP.x0+12,TP.y1-TP.y0+12);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=2;ctx.strokeRect(TP.x0-6,TP.y0-6,TP.x1-TP.x0+12,TP.y1-TP.y0+12);
+  ctx.save();ctx.beginPath();ctx.rect(TP.x0,TP.y0,TP.x1-TP.x0,TP.y1-TP.y0);ctx.clip();
+  /* 纸面：照度跟 curves.rms（纸面被房间光照亮），高频纤维纹随行程滚动 */
+  const lit=0.76+0.28*rN;   /* 纸面照度 ← curves.rms：曲子里没能量，纸就暗下去 */
+  const pg=ctx.createLinearGradient(0,TP.y0,0,TP.y1);
+  pg.addColorStop(0,'rgb('+Math.round(206*lit)+','+Math.round(213*lit)+','+Math.round(224*lit)+')');
+  pg.addColorStop(1,'rgb('+Math.round(156*lit)+','+Math.round(164*lit)+','+Math.round(177*lit)+')');
+  ctx.fillStyle=pg;ctx.fillRect(TP.x0,TP.y0,TP.x1-TP.x0,TP.y1-TP.y0);
+  if(PAPER){const off=(((Pnow*SCALE)%PH)+PH)%PH;
+    ctx.globalAlpha=0.9;ctx.drawImage(PAPER,TP.x0,TP.y0+off);ctx.drawImage(PAPER,TP.x0,TP.y0+off-PH);ctx.globalAlpha=1;}
+  /* 沉积层：明度=bright · 不透明度=energy · 点画=noise · 左缘刻度=onset_per_s · 暗裂纹=tension */
+  for(let s=0;s<secs.length;s++){const sc=secs[s];
+    const P1=f.P[Math.min(f.fr,Math.floor(sc.start*f.fps))];
+    const P2=f.P[Math.min(f.fr,Math.ceil(sc.end*f.fps))];
+    if(P1>Pnow)continue;
+    const ya=Math.max(TP.y0,yOf(Math.min(P2,Pnow))),yb=Math.min(TP.y1,yOf(P1));
+    if(yb-ya<0.5)continue;
+    const br=Number.isFinite(sc.bright)?clamp01(sc.bright):0.5;
+    const en=Number.isFinite(sc.energy)?clamp01(sc.energy):0;
+    const lv=Math.round(14+102*br);
+    ctx.fillStyle='rgb('+lv+','+(lv+5)+','+(lv+12)+')';ctx.globalAlpha=0.30+0.62*en;
+    ctx.fillRect(TP.x0+2,ya,TP.x1-TP.x0-4,yb-ya);ctx.globalAlpha=1;
+    /* 纸的厚度：左缘当光、右缘落影（只是一层渐变，不改任何读数） */
+    const thg=ctx.createLinearGradient(TP.x0+2,0,TP.x0+150,0);
+    thg.addColorStop(0,'rgba(236,242,250,0.10)');thg.addColorStop(1,'rgba(236,242,250,0)');
+    ctx.fillStyle=thg;ctx.fillRect(TP.x0+2,ya,148,yb-ya);
+    /* 层顶：一条深色层理 + 一条浅色高光（地层分界的可读性靠这两条） */
+    ctx.strokeStyle='rgba(12,16,22,'+(0.45+0.4*en).toFixed(2)+')';ctx.lineWidth=1+3*en;
+    ctx.beginPath();ctx.moveTo(TP.x0+2,ya);ctx.lineTo(TP.x1-2,ya);ctx.stroke();
+    ctx.strokeStyle='rgba(240,245,252,0.35)';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(TP.x0+2,ya+2.5);ctx.lineTo(TP.x1-2,ya+2.5);ctx.stroke();
+    /* 点画密度 ← noise */
+    const noise=Number.isFinite(sc.noise)?clamp01(sc.noise):0,nd=Math.floor(noise*(yb-ya)*2.2);
+    ctx.fillStyle='rgba(14,18,24,0.55)';
+    for(let d=0;d<nd;d++)ctx.fillRect(TP.x0+4+hash(s*991+d*7)*(TP.x1-TP.x0-8),
+      ya+hash(s*7717+d*13)*(yb-ya),1.8,1.8);
+    /* 左缘刻度 ← onset_per_s（绝对 次/s） */
+    const ops=Number.isFinite(sc.onset_per_s)?sc.onset_per_s:0;
+    const nT=Math.min(Math.floor((yb-ya)/5),Math.floor(ops*(sc.end-sc.start)));
+    ctx.fillStyle='rgba(22,28,36,0.72)';
+    for(let d=0;d<nT;d++)ctx.fillRect(TP.x0+5,ya+hash(s*313+d*101)*(yb-ya),5,2);
+    /* 暗裂纹 ← tension */
+    const tn=Number.isFinite(sc.tension)?clamp01(sc.tension):0,nc=Math.round(tn*5);
+    ctx.strokeStyle='rgba(10,14,19,0.55)';ctx.lineWidth=1.2;
+    for(let d=0;d<nc;d++){let yy=ya+hash(s*577+d*61)*(yb-ya),xx=TP.x0+12;
+      ctx.beginPath();ctx.moveTo(xx,yy);
+      for(let q=0;q<6;q++){xx+=hash(s*991+d*13+q)*52+10;yy+=(hash(s*131+d*71+q)-0.5)*14*tn;ctx.lineTo(xx,yy);}
+      ctx.stroke();}
+    /* 标注台手绘压印（CONTRACT §5 sketch，0–1 归一）：叠在本沉积层上 */
+    if(sc.sketch&&sc.sketch.length){ctx.save();ctx.globalAlpha=0.9;ctx.lineJoin='round';ctx.lineCap='round';
+      for(const stk of sc.sketch){if(!stk||!Array.isArray(stk.pts)||stk.pts.length<2)continue;
+        ctx.strokeStyle=(typeof stk.c==='string'&&/^#[0-9a-fA-F]{6}$/.test(stk.c))?stk.c:'#1a2129';
+        ctx.lineWidth=Math.max(1,Math.min(6,Number.isFinite(stk.w)?stk.w:2));
+        ctx.beginPath();let drew=false;
+        for(const pt of stk.pts){if(!Array.isArray(pt))continue;
+          const xx2=TP.x0+2+clamp01(+pt[0])*(TP.x1-TP.x0-4);
+          const yy2=ya+clamp01(+pt[1])*(yb-ya);
+          if(drew)ctx.lineTo(xx2,yy2);else{ctx.moveTo(xx2,yy2);drew=true;}}
+        ctx.stroke();}
+      ctx.restore();}
+  }
+  /* 细纹层（微层）：每一帧一条，厚度=1px、密度←curves.rms、短杠←curves.onset。
+     这是纸带"被压出来"的最小单位：rms 清零 → 无纹、P 冻结 → 纸带不走。 */
+  if(f.crv.rms){
+    const j0=Math.max(0,j-170);
+    for(let jj=j0;jj<=j;jj++){
+      const y=yOf(f.P[jj+1]);if(y<TP.y0-2||y>TP.y1+2)continue;
+      const rr=clamp01(f.crv.rms[jj]/255);
+      const onn=f.crv.onset?clamp01(f.crv.onset[jj]/255):0;
+      ctx.fillStyle='rgba(12,17,23,'+(0.08+0.32*rr).toFixed(3)+')';
+      ctx.fillRect(TP.x0+3,y,TP.x1-TP.x0-6,1.2);
+      if(onn>0.5){ctx.fillStyle='rgba(8,12,17,0.6)';
+        ctx.fillRect(TP.x0+3,y,22+140*onn,2);}
+    }
+  }
+  /* ghost 层界 = suggestions_by_k[k]（未确认，琥珀虚线） */
+  for(const gg of gs){const P1=f.P[Math.min(f.fr,Math.floor(gg.start*f.fps))];
+    if(P1>Pnow)continue;const y=yOf(P1);
+    if(y>TP.y0&&y<TP.y1){ctx.strokeStyle=C.amber;ctx.globalAlpha=0.8;ctx.setLineDash([6,5]);ctx.lineWidth=1.4;
+      ctx.beginPath();ctx.moveTo(TP.x0+4,y);ctx.lineTo(TP.x1-4,y);ctx.stroke();ctx.setLineDash([]);ctx.globalAlpha=1;}}
+  /* 标注台建议段（auto && !confirmed）：只画点线显示，不驱动层与压印 */
+  for(const rg2 of (BUNDLE.sugg_regions||[])){if(!rg2||!Number.isFinite(+rg2.t0))continue;
+    const Ps=f.P[Math.min(f.fr,Math.floor(Math.max(0,+rg2.t0)*f.fps))];
+    if(Ps>Pnow)continue;const y=yOf(Ps);
+    if(y>TP.y0&&y<TP.y1){ctx.strokeStyle=C.amber;ctx.globalAlpha=0.6;ctx.setLineDash([2,4]);ctx.lineWidth=1.2;
+      ctx.beginPath();ctx.moveTo(TP.x0+4,y);ctx.lineTo(TP.x1-4,y);ctx.stroke();ctx.setLineDash([]);ctx.globalAlpha=1;}}
+  /* 当前段：左缘琥珀压印标记（跟着段高走，段界滚动时会在纸带上"跑"） */
+  if(sec){const a=Math.max(TP.y0,yOf(f.P[Math.min(f.fr,Math.ceil(sec.end*f.fps))])),
+              b=Math.min(TP.y1,yOf(f.P[Math.min(f.fr,Math.floor(sec.start*f.fps))]));
+    if(b>a){ctx.fillStyle=C.amber;ctx.globalAlpha=0.75;ctx.fillRect(TP.x0+1,a,3,b-a);ctx.globalAlpha=1;}}
+  /* 照光带：亮←curves.rms 的连续扫描光，位置跟行程 P（数据清零 → 停） */
+  const spanT=TP.y1-TP.y0,bh=Math.round(spanT*0.34),cyc=spanT+bh;
+  const bandY=TP.y0-bh+((((Pnow*SCALE*1.3)%cyc)+cyc)%cyc);
+  ctx.save();ctx.globalCompositeOperation='lighter';
+  const lbg=ctx.createLinearGradient(0,bandY,0,bandY+bh);
+  lbg.addColorStop(0,'rgba(120,142,172,0)');
+  lbg.addColorStop(0.5,'rgba(120,142,172,'+(0.10+0.22*rN).toFixed(3)+')');
+  lbg.addColorStop(1,'rgba(120,142,172,0)');
+  ctx.fillStyle=lbg;ctx.fillRect(TP.x0,TP.y0,TP.x1-TP.x0,TP.y1-TP.y0);
+  ctx.fillStyle='rgba(228,240,255,'+(0.18+0.30*rN).toFixed(3)+')';
+  ctx.fillRect(TP.x0,bandY+bh/2-1,TP.x1-TP.x0,2);
+  ctx.restore();
+  ctx.restore();
+  /* 纸带外框 + 压印窗口上沿（琥珀） */
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.6;ctx.strokeRect(TP.x0+.5,TP.y0+.5,TP.x1-TP.x0-1,TP.y1-TP.y0-1);
+  ctx.strokeStyle=C.amber;ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(TP.x0-8,TP.y0+1);ctx.lineTo(TP.x1+8,TP.y0+1);ctx.stroke();
+  /* 压头接触阴影：只跟 press，数据清零就没有压痕 */
+  if(press>0.03){
+    const sh=ctx.createLinearGradient(0,TP.y0,0,TP.y0+70);
+    sh.addColorStop(0,'rgba(10,14,20,'+(0.28*press).toFixed(3)+')');
+    sh.addColorStop(1,'rgba(10,14,20,0)');
+    ctx.fillStyle=sh;ctx.fillRect(TP.x0,TP.y0,TP.x1-TP.x0,70);}
+  /* 顶光：从横梁落到纸带上的一层柔光（不是硬边光锥：避免把纸带洗成几何色块） */
+  ctx.save();ctx.globalCompositeOperation='lighter';
+  {
+    const tg=ctx.createLinearGradient(0,BEAM.y1,0,TP.y0+190);
+    tg.addColorStop(0,'rgba(198,216,240,'+(0.07+0.09*rN).toFixed(3)+')');
+    tg.addColorStop(1,'rgba(198,216,240,0)');
+    ctx.fillStyle=tg;ctx.fillRect(TP.x0,BEAM.y1,TP.x1-TP.x0,TP.y0+190-BEAM.y1);
+  }
+  ctx.restore();
+  /* 浮尘：一层随行程缓慢上移的纤维（舞台的空气感；不停就不动） */
+  if(DUST){const off=(((Pnow*5)%DH)+DH)%DH;
+    ctx.save();ctx.beginPath();ctx.rect(0,STAGE.y0,L.W,STAGE.y1-STAGE.y0);ctx.clip();
+    ctx.globalAlpha=0.5;ctx.drawImage(DUST,0,STAGE.y0+off);ctx.drawImage(DUST,0,STAGE.y0+off-DH);
+    ctx.globalAlpha=1;ctx.restore();}
+
+  /* ---- 出纸段 + 送纸辊 + 传动带（转角 ω ← ∫rms×段energy，数据清零=停走） ---- */
+  ctx.save();ctx.beginPath();ctx.rect(TP.x0,TP.y1,TP.x1-TP.x0,46);ctx.clip();
+  const wg=ctx.createLinearGradient(0,TP.y1,0,TP.y1+46);
+  wg.addColorStop(0,'rgba(199,206,217,0.92)');wg.addColorStop(1,'rgba(126,136,150,0.96)');
+  ctx.fillStyle=wg;ctx.fillRect(TP.x0,TP.y1,TP.x1-TP.x0,46);
+  const wo=(((Pnow*SCALE*1.3)%18)+18)%18;
+  ctx.strokeStyle='rgba(92,104,120,0.30)';ctx.lineWidth=1;
+  for(let x=TP.x0-46+wo;x<TP.x1+46;x+=18){ctx.beginPath();ctx.moveTo(x,TP.y1);ctx.lineTo(x-28,TP.y1+46);ctx.stroke();}
+  ctx.restore();
+  const RY=722,RR=28;
+  for(const rx of [430,1170]){
+    ctx.fillStyle='#141a20';ctx.fillRect(rx-12,RY+RR-2,24,752-RY-RR+2);
+    ctx.strokeStyle=C.frame;ctx.lineWidth=1;ctx.strokeRect(rx-12,RY+RR-2,24,752-RY-RR+2);
+    ctx.save();ctx.translate(rx,RY);ctx.rotate(Pnow*0.09);
+    ctx.strokeStyle=C.hi;ctx.lineWidth=2.6;ctx.beginPath();ctx.arc(0,0,RR,0,7);ctx.stroke();
+    ctx.strokeStyle='rgba(147,165,184,0.55)';ctx.lineWidth=1.4;
+    for(let k=0;k<8;k++){ctx.beginPath();ctx.moveTo(0,0);ctx.lineTo(Math.cos(k*Math.PI/4)*RR,Math.sin(k*Math.PI/4)*RR);ctx.stroke();}
+    ctx.fillStyle=C.hi;ctx.beginPath();ctx.arc(0,0,3.6,0,7);ctx.fill();ctx.restore();
+    ctx.strokeStyle='rgba(74,86,101,0.9)';ctx.lineWidth=1.2;ctx.beginPath();ctx.arc(rx,RY,RR+4,0,7);ctx.stroke();}
+  ctx.strokeStyle='#2b333c';ctx.lineWidth=6;
+  ctx.beginPath();ctx.moveTo(430,RY);ctx.lineTo(1170,RY);ctx.stroke();
+  ctx.strokeStyle='rgba(195,208,221,0.30)';ctx.lineWidth=2;ctx.setLineDash([10,16]);
+  ctx.lineDashOffset=-((Pnow*SCALE*1.6)%26);
+  ctx.beginPath();ctx.moveTo(430,RY);ctx.lineTo(1170,RY);ctx.stroke();
+  ctx.setLineDash([]);ctx.lineDashOffset=0;
+
+  /* ---- 右缘：档案时间尺 t（绝对秒，独立于行程 P） ---- */
+  const RX=1278;
+  ctx.strokeStyle='rgba(120,140,160,0.55)';ctx.lineWidth=1.4;
+  ctx.beginPath();ctx.moveTo(RX,TP.y0);ctx.lineTo(RX,TP.y1);ctx.stroke();
+  for(let s=0;s<=f.dur;s+=10){const yy=TP.y0+(s/f.dur)*(TP.y1-TP.y0);
+    const big=(s%30===0);
+    ctx.strokeStyle=big?'rgba(160,178,198,0.8)':'rgba(120,140,160,0.45)';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(RX,yy);ctx.lineTo(RX+(big?10:6),yy);ctx.stroke();}
+  {const ty=TP.y0+clamp01(t/f.dur)*(TP.y1-TP.y0);
+   ctx.fillStyle=C.amber;ctx.beginPath();ctx.moveTo(RX-3,ty);ctx.lineTo(RX+9,ty-5);ctx.lineTo(RX+9,ty+5);ctx.closePath();ctx.fill();}
+  lab(2,1282,TP.y0+6,['0s'],26,14,C.dim,'left',{fixed:true});
+  lab(2,1282,TP.y1-6,[nz(f.dur,0)+'s'],40,14,C.dim,'left',{fixed:true});
+
+  /* ---- 底座上的"档案目录尺"：段界（冷）/ ghost 建议层界（琥珀）/ 此刻（琥珀针） ----
+     这是舞台上的图记，不是读数板：k 切层杆一动，琥珀齿就换一组，故 ghost 建议永远可见。 */
+  {
+    const RX0=340,RX1=1260,RYY=772;
+    ctx.strokeStyle='rgba(120,140,160,0.45)';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(RX0,RYY);ctx.lineTo(RX1,RYY);ctx.stroke();
+    for(const sc of secs){const x=RX0+clamp01(sc.end/f.dur)*(RX1-RX0);
+      ctx.strokeStyle='rgba(178,192,208,0.70)';ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo(x,RYY-8);ctx.lineTo(x,RYY);ctx.stroke();}
+    for(const gg of gs){const x=RX0+clamp01(gg.start/f.dur)*(RX1-RX0);
+      ctx.strokeStyle=C.amber;ctx.lineWidth=1.4;
+      ctx.beginPath();ctx.moveTo(x,RYY);ctx.lineTo(x,RYY+9);ctx.stroke();}
+    for(const b of (BUNDLE.suggestion_bounds||[])){
+      const xa=RX0+clamp01(+b[0]/f.dur)*(RX1-RX0),xb=RX0+clamp01(+b[1]/f.dur)*(RX1-RX0);
+      ctx.strokeStyle=C.amber;ctx.setLineDash([2,3]);ctx.globalAlpha=0.85;ctx.lineWidth=1;
+      ctx.strokeRect(xa,RYY-5,Math.max(2,xb-xa),10);ctx.setLineDash([]);ctx.globalAlpha=1;}
+    const cx3=RX0+clamp01(t/f.dur)*(RX1-RX0);
+    ctx.strokeStyle=C.amber;ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(cx3,RYY-11);ctx.lineTo(cx3,RYY+9);ctx.stroke();
+  }
+  lab(2,490,740,['档案目录尺：段界（冷，向上）· ghost 建议层界（琥珀，向下）· 此刻（琥珀针）· 未确认建议框（点线）',
+    '档案目录尺：段界（冷）· ghost 建议（琥珀）· 此刻（琥珀针）'],600,14,C.dim,'left',{fixed:true});
+
+  /* ================= 悬浮 HUD（舞台上的仪表，读数退成注脚） ================= */
+  /* 左：chroma / key → 配方台；层账本（逐段一行）；纸带 / 送纸辊 / 照光带口径 */
+  plate(WL.x0,150,WL.x1,352,0.88);
+  plate(WL.x0,362,WL.x1,642,0.88);
+  plate(WL.x0,652,WL.x1,748,0.88);
+  /* 右：novelty；verify / 口径；标注台笔迹 / 未确认建议 */
+  plate(WR.x0,150,WR.x1,312,0.88);
+  plate(WR.x0,322,WR.x1,530,0.88);
+  plate(WR.x0,540,WR.x1,640,0.88);
+  bracket(WL.x0-20,152,WL.x0);bracket(WL.x0-20,640,WL.x0);
+  bracket(WR.x1,152,WR.x1+20);bracket(WR.x1,638,WR.x1+20);
+
+  /* chroma 柱（12 音级，均值） */
+  if(f.chromaMean){
+    const bx=WL.x0+10,bw=WL.x1-WL.x0-20,base=256;
+    ctx.strokeStyle='#20272f';ctx.lineWidth=1;ctx.strokeRect(bx,196,bw,60);
+    for(let c=0;c<12;c++){const v=clamp01(num(f.chromaMean[c],0));
+      const x=bx+4+c*((bw-8)/12);
+      ctx.fillStyle=C.mid;ctx.globalAlpha=0.40+0.55*v;
+      ctx.fillRect(x,base-v*54,((bw-8)/12)-3,v*54);ctx.globalAlpha=1;}
+  }else{ctx.strokeStyle='#20272f';ctx.strokeRect(WL.x0+10,196,WL.x1-WL.x0-20,60);
+    lab(2,WL.x0+16,226,['chroma 未提供'],170,14,C.amber,'left',{fixed:true});}
+  /* novelty 曲线 */
+  {
+    const nx=WR.x0+8,ny=182,nw=WR.x1-WR.x0-16,nh=80;
+    ctx.fillStyle='#0a0e12';ctx.fillRect(nx,ny,nw,nh);
+    ctx.strokeStyle='#20272f';ctx.strokeRect(nx+.5,ny+.5,nw-1,nh-1);
+    if(f.nov&&f.nov.length){
+      let mx=1e-6;for(let k=0;k<f.nov.length;k++)if(f.nov[k]>mx)mx=f.nov[k];
+      ctx.strokeStyle=C.mid;ctx.lineWidth=1.3;ctx.beginPath();
+      for(let k=0;k<=100;k++){const jj=Math.round(k/100*(f.fr-1));
+        const xx=nx+nw*k/100,yy=ny+nh-3-(f.nov[jj]/mx)*(nh-6);
+        if(k)ctx.lineTo(xx,yy);else ctx.moveTo(xx,yy);}
+      ctx.stroke();
+      for(const sc of secs){const xx=nx+clamp01(sc.end/f.dur)*nw;
+        ctx.strokeStyle='rgba(109,127,146,0.5)';ctx.setLineDash([3,4]);ctx.lineWidth=1;
+        ctx.beginPath();ctx.moveTo(xx,ny+2);ctx.lineTo(xx,ny+nh-2);ctx.stroke();ctx.setLineDash([]);}
+      const cx2=nx+clamp01(t/f.dur)*nw;
+      ctx.strokeStyle=C.amber;ctx.lineWidth=1.6;ctx.beginPath();ctx.moveTo(cx2,ny+2);ctx.lineTo(cx2,ny+nh-2);ctx.stroke();
+    }
+  }
+
+  /* ================= 顶栏（读数带 1，96px / 4 行） ================= */
+  ctx.fillStyle='rgba(7,10,13,0.965)';ctx.fillRect(0,0,L.W,TOP.y1);
+  hairline(0,TOP.y1-0.5,L.W);
+  label(0,24,20,'C · 地层档案压机 · 舞台优先',16,C.ink,'left',{fixed:true});
+  lab(0,1576,20,['t '+t.toFixed(2)+' s / '+nz(f.dur,2)+' s','t '+t.toFixed(1)+' / '+nz(f.dur,1)+' s'],
+    320,15,C.hi,'right',{fixed:true});
+  lab(0,24,42,[f.name+' · '+nz(f.dur,1)+'s · '+f.fps+'fps · '+(f.rhythm?nz(f.rhythm.bpm,2)+' BPM':'拍速未分析'),
+    f.name+' · '+nz(f.dur,1)+'s'],520,14,C.dim,'left',{fixed:true});
+  const secModeTxt=BUNDLE.sec_mode==='regions'
+    ?('层界 = 标注台人工段 '+secs.length+' 段（regions 优先）')
+    :BUNDLE.sec_mode==='sections-fallback'
+    ?('sections = '+secs.length+' 段（自动·未经人工确认）')
+    :('sections = '+secs.length+' 段 · default_k = '+txt(f.defaultK)+' · 段读数为段内均值（归一）');
+  lab(0,592,42,[secModeTxt,'sections = '+secs.length+' 段 · default_k = '+txt(f.defaultK),
+    'sections = '+secs.length+' 段'],500,14,
+    (BUNDLE.sec_mode==='sections-fallback')?C.amber:C.ink,'left',{fixed:true});
+  const barsTxt=gridSig===false
+    ?['bars 口径：grid_significant=false → 契约下发空值 → 不可计','bars 口径：grid=false → 不可计','bars：不可计']
+    :(gridSig===null
+      ?['bars 口径：grid_significant 未提供','bars：未提供']
+      :['grid_significant=true · bars = 已过显著性检验的拍网格小节数','grid=true · bars = 已过检验的拍网格小节数','bars = 已过检验']);
+  lab(0,1576,42,barsTxt,470,14,(gridSig===false?C.amber:C.ink),'right',{fixed:true});
+  lab(0,24,64,['structure.method = '+txt(f.method)],1530,14,C.dim,'left',{fixed:true});
+  lab(0,24,86,[BUNDLE.received?('来自标注台 · '+noell(String(BUNDLE.project))+' · 拍速 '+
+      (Number.isFinite(BUNDLE.bpm)?nz(BUNDLE.bpm,1):'未提供')+'（'+noell(String(BUNDLE.bpm_source))+'）')
+      :'数据源：未载入（可拖入 features.json，或由标注台送包）',
+      BUNDLE.received?('来自标注台 · '+noell(String(BUNDLE.project))):'数据源：未载入'],
+    640,14,BUNDLE.received?(BUNDLE.sec_mode==='sections-fallback'?C.amber:C.hi):C.dim,'left',{fixed:true});
+  lab(0,700,86,['走带量 P = '+nz(Pnow,1)+' / 全长 '+nz(Pmax,1)+'（归一积分）',
+    'P = '+nz(Pnow,1)+' / '+nz(Pmax,1)],420,14,C.hi,'left',{fixed:true});
+  lab(0,1576,86,['当前段 #'+(sIdx>=0?(sIdx+1):'—')+' / '+secs.length+
+      (sec?' · '+nz(sec.start,1)+'→'+nz(sec.end,1)+'s':'（段间隙·无）'),
+    '段 #'+(sIdx>=0?(sIdx+1):'—')+' / '+secs.length],380,14,sec?C.hi:C.amber,'right',{fixed:true});
+
+  /* ================= 底栏（读数带 2，108px / 4 行） ================= */
+  ctx.fillStyle='rgba(7,10,13,0.97)';ctx.fillRect(0,BOT.y0,L.W,L.H-BOT.y0);
+  hairline(0,BOT.y0+0.5,L.W);
+  const secRow=sec?((BUNDLE.sec_mode==='regions'?'人工段':'sections')+'实读['+sIdx+'] · start '+nz(sec.start,2)+
+      ' · end '+nz(sec.end,2)+' · bars '+barsText(sec)+' · energy '+nz(sec.energy,3)+
+      ' · bright '+nz(sec.bright,3)+' · tension '+nz(sec.tension,3)+' · noise '+nz(sec.noise,3))
+      :'段间隙（无段读数）';
+  lab(0,24,810,[secRow+' · lowhigh '+nz(sec?sec.lowhigh:NaN,3)+' · onset_per_s '+nz(sec?sec.onset_per_s:NaN,2)+
+      ' · novelty '+nz(sec?sec.novelty:NaN,3),secRow],
+    1286,14,C.hi,'left',{fixed:true});
+  lab(0,1576,810,['第 '+(sIdx>=0?(sIdx+1):'—')+' / '+secs.length+' 段 · 段内均值',
+    '第 '+(sIdx>=0?(sIdx+1):'—')+' / '+secs.length+' 段'],240,14,C.dim,'right',{fixed:true});
+  const fldL='字段 · 压印 '+nz(press,3)+' ← rms×段energy · 横振 '+nz(nv,3)+' ← novelty 差分 · 点画 '+
+      (sec?nz(sec.noise,3):'无')+' · 左缘刻度 '+(sec?nz(sec.onset_per_s,2)+'/s':'无')+' · 裂纹 '+(sec?nz(sec.tension,3):'无');
+  lab(0,24,832,[fldL,fldL.replace(' · 裂纹 '+(sec?nz(sec.tension,3):'无'),'')],860,14,C.dim,'left',{fixed:true});
+  const fldR='层界 '+(sec?nz(sec.start,1)+'→'+nz(sec.end,1)+'s':'段间隙')+
+      '（'+(BUNDLE.sec_mode==='regions'?'标注台人工段':'默认k='+txt(f.defaultK))+'） · ghost '+gs.length+
+      ' 条(k='+txt(M.ghostK)+') · 段数 '+secs.length+' · 调性 '+
+      ((f.key&&f.key.name)?(txt(f.key.name)+' '+txt(f.key.mode)):'调性不可定')+
+      ' · 自证 '+(f.raw.verify?nz(f.raw.verify.elapsed_s,1)+'s':'未提供');
+  lab(0,1576,832,[fldR,fldR.replace(' · 自证 '+(f.raw.verify?nz(f.raw.verify.elapsed_s,1)+'s':'未提供'),'')],
+    680,14,C.dim,'right',{fixed:true});
+  lab(0,24,854,['纸带行程只累计 curves.rms×段energy 的积分：数据清零 → 纸带走不动、压不出层',
+    '纸带行程 = ∫curves.rms×段energy：数据清零 → 纸带停、压不出层',
+    '纸带行程 = ∫rms×段energy（清零即停）'],560,14,C.hi,'left',{fixed:true});
+  lab(0,620,854,['ghost 层界 = suggestions_by_k["'+txt(M.ghostK)+'"]（未确认，琥珀虚线，不驱动层）',
+    'ghost = suggestions_by_k["'+txt(M.ghostK)+'"]（未确认）'],420,14,C.amber,'left',{fixed:true});
+  lab(0,1576,854,['层色标尺：明度=bright · 不透明=energy · 点画=noise · 刻度=onset/s · 裂纹=tension',
+    '明度=bright · 不透明=energy · 点画=noise · 刻度=onset/s · 裂纹=tension',
+    '明度=bright · 不透明=energy · 点画=noise'],530,14,C.dim,'right',{fixed:true});
+  const ls=window.__SELFTEST__||{};
+  lab(0,24,876,['账本 相交 '+num(ls.label_collisions,'—')+' 登记 '+num(ls.label_checked,'—')+
+      ' 丢 '+num(ls.label_dropped,'—')+' 省略 '+num(ls.label_ellipsis,'—')+
+      ' 字 '+num(ls.min_drawn_font_px,'—')+'px 舞台 77.3%',
+    '账本 相交 '+num(ls.label_collisions,'—')+' 省略 '+num(ls.label_ellipsis,'—')],430,14,C.dim,'left',{fixed:true});
+  lab(0,1576,876,['色表：琥珀=未确认/降级 · 冷色=已确认读数','琥珀=未确认/降级'],400,14,C.dim,'right',{fixed:true});
+
+  /* ================= 舞台上的字（跟着机构走的标注；14px 行距 ≥20 保证不互压） ================= */
+  lab(1,WL.x0+8,164,['chroma.mean[12]','chroma'],210,14,C.ink,'left',{fixed:true});
+  lab(1,WL.x0+8,184,['配方台 · 12 音级色度均值','12 音级色度均值'],210,14,C.dim,'left',{fixed:true});
+  lab(2,WL.x0+8,276,['C C# D D# E F'],210,14,C.dim,'left',{fixed:true});
+  lab(2,WL.x0+8,296,['F# G G# A A# B'],210,14,C.dim,'left',{fixed:true});
+  const keyOK=f.key&&f.key.name;
+  lab(2,WL.x0+8,316,[keyOK?('key.name '+txt(f.key.name)+' '+txt(f.key.mode)):'key.name 空 → 调性不可定',
+    keyOK?('key '+txt(f.key.name)+' '+txt(f.key.mode)):'调性不可定'],210,14,keyOK?C.ink:C.amber,'left',{fixed:true});
+  lab(2,WL.x0+8,336,['corr/maj/min '+nz(f.key?f.key.corr:NaN,2)+'/'+nz(f.key?f.key.maj_corr:NaN,2)+'/'+nz(f.key?f.key.min_corr:NaN,2),
+    'corr '+nz(f.key?f.key.corr:NaN,2)+'/'+nz(f.key?f.key.maj_corr:NaN,2)+'/'+nz(f.key?f.key.min_corr:NaN,2)],210,14,C.hi,'left',{fixed:true});
+
+  /* 层账本：窗口 6 行（含当前段），行 = 段号·起止·bars ／ E B T N 次/s */
+  const NSE=secs.length;
+  const winN=Math.min(6,NSE);
+  const st0=NSE>0?Math.max(0,Math.min(NSE-winN,Math.round(sIdx>=0?(sIdx-2):0))):0;
+  lab(1,WL.x0+8,376,['层账本 第 '+(NSE?(st0+1):0)+'–'+Math.min(NSE,st0+winN)+' 段 / 共 '+NSE+' 段',
+    '层账本 '+(NSE?(st0+1):0)+'–'+Math.min(NSE,st0+winN)+' / '+NSE],210,14,C.ink,'left',{fixed:true});
+  for(let k=0;k<winN;k++){const s2=st0+k,sc=secs[s2],yy=398+k*40;
+    const bt=barsText(sc);
+    lab(2,WL.x0+8,yy,[('段'+(s2+1)+' '+nz(sc.start,1)+'–'+nz(sc.end,1)+'s · bars '+bt),
+      ('段'+(s2+1)+' '+nz(sc.start,1)+'–'+nz(sc.end,1)+'s · '+bt),('段'+(s2+1)+' '+nz(sc.start,1)+'–'+nz(sc.end,1)+'s')],210,14,
+      (s2===sIdx)?C.amber:C.ink,'left',{fixed:true});
+    lab(3,WL.x0+8,yy+20,[('E'+nz(sc.energy,2)+' B'+nz(sc.bright,2)+' T'+nz(sc.tension,2)+' N'+nz(sc.noise,2)+' '+nz(sc.onset_per_s,1)+'/s'),
+      ('E'+nz(sc.energy,2)+' B'+nz(sc.bright,2)+' T'+nz(sc.tension,2)+' N'+nz(sc.noise,2)),
+      ('E'+nz(sc.energy,2)+' B'+nz(sc.bright,2))],210,14,
+      (bt==='不可计')?C.amber:C.dim,'left',{fixed:true});}
+  lab(1,WL.x0+8,666,['纸带 越往下越老 · 层序=行程 P','纸带 越往下越老'],210,14,C.dim,'left',{fixed:true});
+  lab(1,WL.x0+8,686,['送纸辊 ω ← ∫rms×段energy','送纸辊 转速←∫rms'],210,14,C.dim,'left',{fixed:true});
+  lab(1,WL.x0+8,706,['照光带 亮 ← curves.rms','照光带 ← rms'],210,14,C.dim,'left',{fixed:true});
+  lab(1,WL.x0+8,726,['数据清零 = 停走、压不出层','清零即停'],210,14,C.amber,'left',{fixed:true});
+
+  /* k 切层杆（4/6/8/10；切换 ghost 层界，不驱动层） */
+  for(let k=0;k<4;k++){const kk=String([4,6,8,10][k]),x=LEVELS[k],act=(M.ghostK===kk);
+    ctx.fillStyle=act?'#1e2630':'#141a20';ctx.fillRect(x,LEVY[0],44,20);
+    ctx.strokeStyle=act?C.amber:C.plateEd;ctx.lineWidth=1;ctx.strokeRect(x+.5,LEVY[0]+.5,43,19);
+    label(1,x+22,LEVY[0]+10,'k='+kk,14,act?C.amber:C.mid,'center',{fixed:true});}
+  lab(1,WR.x0+8,690,['ghost 切层杆（建议值，未确认）','ghost 切层杆'],120,14,C.dim,'left',{fixed:true});
+
+  /* 右：novelty 牌 */
+  lab(1,WR.x0+8,164,['structure.novelty（归一）','novelty'],190,14,C.ink,'left',{fixed:true});
+  lab(2,WR.x0+8,280,['段界虚线 · 琥珀=此刻 · 峰值 '+(f.nov?nz(peakNov(f),3):'未提供'),
+    '琥珀=此刻 · 峰值 '+(f.nov?nz(peakNov(f),3):'未提供'),'峰值 '+(f.nov?nz(peakNov(f),3):'未提供')],190,14,C.dim,'left',{fixed:true});
+  lab(2,WR.x0+8,300,['novelty 差分 → 压印头横振','差分 → 横振'],190,14,C.dim,'left',{fixed:true});
+  /* 右：verify / 口径 */
+  lab(1,WR.x0+8,336,['分析器自证 verify','verify'],190,14,C.ink,'left',{fixed:true});
+  const v=f.raw.verify,vCk=v&&v.checks?v.checks:[];
+  const vRows=[['elapsed '+(v?nz(v.elapsed_s,1)+'s':'未提供')],
+    ['checks '+(v?(vCk.filter(c=>c.ok).length+'/'+vCk.length+' 过'):'未提供')],
+    ['default_k '+txt(f.defaultK)],
+    ['suggestions_by_k '+(Object.keys(f.sugg).join('/')||'未提供')],
+    ['onset_rate_per_s '+(f.mood?nz(f.mood.onset_rate_per_s,2):'未分析')],
+    ['rms[j] '+nz(rms,3)+'（归一）'],
+    ['grid_significant '+(gridSig===null?'未提供':String(gridSig))],
+    ['stems '+(f.stems?('死通道 '+f.stems.filter(s=>s&&s.dead===true).length+'/'+f.stems.length):'未分析')],
+    ['method 原文见顶栏第三行']];
+  vRows.forEach((rw,k)=>lab(3,WR.x0+8,356+k*20,[rw[0],rw[0].split(' ')[0]],190,14,C.dim,'left',{fixed:true}));
+  /* 右：笔迹 / 未确认建议 */
+  lab(2,WR.x0+8,554,[BUNDLE.sketch_strokes?('标注台笔迹 '+BUNDLE.sketch_strokes+' 笔 · 叠在人工段层上'):'标注台笔迹 0 笔',
+    '笔迹 '+BUNDLE.sketch_strokes+' 笔'],190,14,BUNDLE.sketch_strokes?C.hi:C.dim,'left',{fixed:true});
+  const sb=BUNDLE.suggestion_bounds||[];
+  lab(2,WR.x0+8,574,[sb.length?('未确认建议 '+sb.length+' 段（仅显示·不驱动）'):'未确认建议 0 段',
+    sb.length?('未确认建议 '+sb.length+' 段'):'未确认建议 0 段'],190,14,sb.length?C.amber:C.dim,'left',{fixed:true});
+  if(sb.length){
+    const list=sb.slice(0,2).map(b=>(+b[0]).toFixed(1)+'–'+(+b[1]).toFixed(1)+'s').join(' ');
+    lab(2,WR.x0+8,594,[list+(sb.length>2?' 等':''),list],190,14,C.amber,'left',{fixed:true});
+  }
+  lab(2,WR.x0+8,614,['右缘竖尺 = 档案时间尺 t（绝对秒）','右缘竖尺 = 时间尺 t'],190,14,C.dim,'left',{fixed:true});
+
+  /* 舞台尺寸声明（实验件：量尺写在画面上） */
+  lab(1,96,118,['舞台 77.3%（会动区域）· 读数带 22.7%','舞台 77% · 读数带 23%'],330,14,C.dim,'left',{fixed:true});
+  lab(1,1576,118,['琥珀=未确认/降级 · 冷色=已确认读数','琥珀=未确认/降级'],330,14,C.dim,'right',{fixed:true});
+  /* 压印头铭牌：跟着滑枕走（压深是活数）；贴在滑枕面上，不压纸带上的层贴标 */
+  label(2,hx,ramTop+ramH*0.42,'压印头 压深 '+nz(press,3),15,C.ink,'center',{fixed:false});
+  /* 层贴标：段号（左）/ E·B（右）——随纸带走，读的是本层 */
+  for(let s=0;s<secs.length;s++){const sc=secs[s];
+    const P1=f.P[Math.min(f.fr,Math.floor(sc.start*f.fps))];
+    const P2=f.P[Math.min(f.fr,Math.ceil(sc.end*f.fps))];
+    if(P1>Pnow)continue;
+    const ya=Math.max(TP.y0,yOf(Math.min(P2,Pnow))),yb=Math.min(TP.y1,yOf(P1));
+    if(yb-ya<26)continue;
+    const cy2=(ya+yb)/2;
+    label(3,TP.x0+14,cy2,'段'+(s+1),15,(s===sIdx)?'#3a2a10':C.ink0,'left',{fixed:false,inkPlate:true});
+    if(yb-ya>=40)lab(3,TP.x1-14,cy2,['E'+nz(sc.energy,2)+' B'+nz(sc.bright,2),
+      'E'+nz(sc.energy,2)+' B'+nz(sc.bright,2)],220,14,C.ink0,'right',{fixed:false,inkPlate:true});}
+
+  LG.flush();
+  el('tRead').textContent=t.toFixed(2)+'s';
+  el('scrub').value=Math.round(t/Math.max(1e-6,f.dur)*1000);
+  syncPanel();
+}
+function peakNov(f){let mx=1e-6;for(let k=0;k<f.nov.length;k++)if(f.nov[k]>mx)mx=f.nov[k];return mx;}
+function syncPanel(){
+  const s=window.__SELFTEST__||{};
+  el('btnPlay').textContent=M.playing?'⏸ 走带':'▶ 走带';
+  el('btnRev').className=M.dir<0?'sel':'';
+  document.body.title='相交='+s.label_collisions+' 登记='+s.label_checked+' 省略号='+s.label_ellipsis+
+    ' 最小字号='+s.min_drawn_font_px+' 舞台='+s.stage_ratio;
+}
+/* ================= 空态（无数据：整机静止，没有任何默认动画） ================= */
+function renderIdle(t){
+  LG.reset({x0:6,y0:6,x1:L.W-6,y1:L.H-6});
+  ctx.fillStyle=C.bg;ctx.fillRect(0,0,L.W,L.H);
+  const sg=ctx.createLinearGradient(0,STAGE.y0,0,STAGE.y1);
+  sg.addColorStop(0,'#0d1218');sg.addColorStop(1,'#0a0f14');
+  ctx.fillStyle=sg;ctx.fillRect(0,STAGE.y0,L.W,STAGE.y1-STAGE.y0);
+  const FR={x0:18,y0:102,x1:1582,y1:786};
+  ctx.fillStyle='#12171d';ctx.fillRect(FR.x0,FR.y0,FR.x1-FR.x0,32);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.4;ctx.strokeRect(FR.x0+.5,FR.y0+.5,FR.x1-FR.x0-1,31);
+  hatch(FR.x0+2,FR.y0+2,FR.x1-FR.x0-4,28,'#1a2129',16);
+  for(const x of [FR.x0+18,FR.x1-18])screw(x,FR.y0+16,5);
+  ctx.fillStyle='#141a20';ctx.fillRect(FR.x0,134,56,652);ctx.fillRect(FR.x1-56,134,56,652);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.4;
+  ctx.strokeRect(FR.x0+.5,134.5,55,651);ctx.strokeRect(FR.x1-55.5,134.5,55,651);
+  hatch(FR.x0+2,136,52,648,'#1b2229',8);hatch(FR.x1-54,136,52,648,'#1b2229',8);
+  ctx.fillStyle='#12171d';ctx.fillRect(FR.x0,752,FR.x1-FR.x0,34);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.4;ctx.strokeRect(FR.x0+.5,752.5,FR.x1-FR.x0-1,33);
+  hatch(FR.x0+2,754,FR.x1-FR.x0-4,30,'#1a2129',18);
+  /* 压机（静止在最高位：没有数据就没有压印） */
+  ctx.fillStyle='#1a2129';ctx.fillRect(330,142,940,50);
+  hatch(331,143,938,48,'#222a33',6);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.8;ctx.strokeRect(330,142,940,50);
+  for(const x of [352,1248])screw(x,167,7);
+  ctx.fillStyle='#1d252e';ctx.fillRect(742,192,116,10);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1.6;ctx.strokeRect(742,192,116,10);
+  rod(548,192,548,210,C.mid,7);rod(1052,192,1052,210,C.mid,7);
+  ctx.fillStyle='#242d37';ctx.strokeStyle=C.hi;ctx.lineWidth=2;
+  ctx.fillRect(560,202,480,52);ctx.strokeRect(560,202,480,52);
+  ctx.fillStyle=C.amber;ctx.beginPath();ctx.arc(800,157,5,0,7);ctx.fill();
+  ctx.fillStyle='#0b0f13';ctx.fillRect(TP.x0-6,TP.y0-6,TP.x1-TP.x0+12,TP.y1-TP.y0+12);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=2;ctx.strokeRect(TP.x0-6,TP.y0-6,TP.x1-TP.x0+12,TP.y1-TP.y0+12);
+  ctx.fillStyle='#121a22';ctx.fillRect(TP.x0,TP.y0,TP.x1-TP.x0,TP.y1-TP.y0);
+  ctx.fillStyle='rgba(150,160,174,0.20)';ctx.fillRect(TP.x0,TP.y1,TP.x1-TP.x0,46);
+  ctx.strokeStyle='rgba(120,140,160,0.35)';ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(340,772);ctx.lineTo(1260,772);ctx.stroke();
+  const RY=722,RR=28;
+  for(const rx of [430,1170]){
+    ctx.fillStyle='#141a20';ctx.fillRect(rx-12,RY+RR-2,24,752-RY-RR+2);
+    ctx.strokeStyle=C.hi;ctx.lineWidth=2.6;ctx.beginPath();ctx.arc(rx,RY,RR,0,7);ctx.stroke();
+    ctx.strokeStyle='rgba(147,165,184,0.55)';ctx.lineWidth=1.4;
+    for(let k=0;k<8;k++){ctx.beginPath();ctx.moveTo(rx,RY);
+      ctx.lineTo(rx+Math.cos(k*Math.PI/4)*RR,RY+Math.sin(k*Math.PI/4)*RR);ctx.stroke();}
+    ctx.fillStyle=C.hi;ctx.beginPath();ctx.arc(rx,RY,3.6,0,7);ctx.fill();}
+  plate(WL.x0,150,WL.x1,352,0.88);plate(WL.x0,362,WL.x1,642,0.88);plate(WL.x0,652,WL.x1,748,0.88);
+  plate(WR.x0,150,WR.x1,312,0.88);plate(WR.x0,322,WR.x1,530,0.88);plate(WR.x0,540,WR.x1,640,0.88);
+  ctx.fillStyle='rgba(7,10,13,0.965)';ctx.fillRect(0,0,L.W,TOP.y1);hairline(0,TOP.y1-0.5,L.W);
+  ctx.fillStyle='rgba(7,10,13,0.97)';ctx.fillRect(0,BOT.y0,L.W,L.H-BOT.y0);hairline(0,BOT.y0+0.5,L.W);
+  label(0,24,20,'C · 地层档案压机 · 舞台优先',16,C.ink,'left',{fixed:true});
+  label(0,1576,20,'t 0.00 s / 未载入',15,C.dim,'right',{fixed:true});
+  lab(0,24,42,['未载入 · 等待 *.features.json（拖入或由标注台送包）','未载入 · 等待 features.json'],640,14,C.amber,'left',{fixed:true});
+  lab(0,24,64,['structure.method = 未分析','method = 未分析'],1530,14,C.dim,'left',{fixed:true});
+  lab(0,24,86,['数据源：未载入（可拖入 features.json，或由标注台送包）','数据源：未载入'],640,14,C.dim,'left',{fixed:true});
+  lab(0,1576,86,['当前段 — / 0','段 — / 0'],380,14,C.dim,'right',{fixed:true});
+  label(0,L.W/2,400,'机器静止：无数据则压机不开张。地层只可能来自 structure.sections 的段内读数。',15,C.mid,'center',{fixed:true,must:true});
+  label(0,L.W/2,430,'走带速率 = curves.rms × 段energy 的积分：曲子里没能量，纸带就不走。',14,C.dim,'center',{fixed:true});
+  label(0,L.W/2,458,'拖入 features.json 即从 t=0 走带；不内嵌任何歌曲。',14,C.dim,'center',{fixed:true});
+  lab(1,WL.x0+8,164,['chroma.mean[12]'],210,14,C.dim,'left',{fixed:true});
+  lab(1,WL.x0+8,376,['层账本 未载入'],210,14,C.dim,'left',{fixed:true});
+  lab(1,WR.x0+8,164,['structure.novelty（归一）'],190,14,C.dim,'left',{fixed:true});
+  lab(1,WR.x0+8,336,['分析器自证 verify'],190,14,C.dim,'left',{fixed:true});
+  lab(1,WL.x0+8,666,['纸带 越往下越老 · 层序=行程 P'],210,14,C.dim,'left',{fixed:true});
+  lab(1,WR.x0+8,554,['标注台笔迹 0 笔'],190,14,C.dim,'left',{fixed:true});
+  lab(1,WR.x0+8,574,['未确认建议 0 段'],190,14,C.dim,'left',{fixed:true});
+  lab(1,96,118,['舞台 77.3%（会动区域）· 读数带 22.7%','舞台 77% · 读数带 23%'],330,14,C.dim,'left',{fixed:true});
+  lab(1,1576,118,['琥珀=未确认/降级 · 冷色=已确认读数','琥珀=未确认/降级'],330,14,C.dim,'right',{fixed:true});
+  lab(0,24,810,['段间隙（无段读数）'],1286,14,C.dim,'left',{fixed:true});
+  lab(0,24,832,['字段 · 压印 未分析 · 横振 未分析'],860,14,C.dim,'left',{fixed:true});
+  lab(0,24,854,['纸带行程 = ∫curves.rms×段energy：数据清零 → 纸带停、压不出层'],560,14,C.hi,'left',{fixed:true});
+  lab(0,1576,854,['层色标尺：明度=bright · 不透明=energy · 点画=noise · 刻度=onset/s · 裂纹=tension',
+    '明度=bright · 不透明=energy · 点画=noise · 刻度=onset/s · 裂纹=tension',
+    '明度=bright · 不透明=energy · 点画=noise'],530,14,C.dim,'right',{fixed:true});
+  lab(0,24,876,['账本：相交 '+num((window.__SELFTEST__||{}).label_collisions,'—')+' · 省略号 '+
+    num((window.__SELFTEST__||{}).label_ellipsis,'—')+' · 舞台 '+( (STAGE.y1-STAGE.y0)/L.H*100).toFixed(1)+'%'],430,14,C.dim,'left',{fixed:true});
+  lab(0,1576,876,['色表：琥珀=未确认/降级'],400,14,C.dim,'right',{fixed:true});
+  LG.flush();syncPanel();
+}
+
+/* ================= 走带 / 装载 ================= */
+function loop(now){window.__raf=(window.__raf|0)+1;
+  if(!loop.last)loop.last=now;const dt=Math.min(0.05,(now-loop.last)/1000);loop.last=now;
+  if(M.f){if(audioEl&&!audioEl.paused&&M.dir>0)M.t=audioEl.currentTime;
+    else if(M.playing){const d=M.f.dur;M.t+=dt*M.speed*M.dir;if(M.t<0){M.t=0;M.dir=1;}if(M.t>d)M.t=0;}
+    render(M.t);}else renderIdle(M.t);
+  requestAnimationFrame(loop);}
+function loadFeatText(s){try{decode(JSON.parse(s));el('btnFeat').textContent='✔ features';el('btnFeat').className='sel';M.t=0;M.playing=true;}
+  catch(e){M.err=String(e&&e.message||e);el('btnFeat').textContent='features 解析失败';el('btnFeat').className='';}}
+async function takeFile(fl){clearBundle();const txtc=await fl.text();try{const j=JSON.parse(txtc);
+  decode(j);el('btnFeat').textContent='✔ '+fl.name;el('btnFeat').className='sel';}
+  catch(e){el('btnFeat').textContent='features 解析失败';el('btnFeat').className='';}}
+async function takeAudioFile(fl){audioEl=audioEl||new Audio();audioEl.src=URL.createObjectURL(fl);
+  el('btnAudio').textContent='音频：'+noell(fl.name);el('btnAudio').className='sel';
+  audioEl.play().catch(()=>{el('btnAudio').textContent='音频：被拦住 · 点画面出声';el('btnAudio').className='';
+    document.addEventListener('pointerdown',()=>{audioEl&&audioEl.play().catch(()=>{});},{once:true});});}
+el('btnFeat').addEventListener('click',()=>el('fpFeat').click());
+el('fpFeat').addEventListener('change',()=>{if(el('fpFeat').files[0])takeFile(el('fpFeat').files[0]);});
+el('btnAudio').addEventListener('click',()=>el('fpAudio').click());
+el('fpAudio').addEventListener('change',()=>{if(el('fpAudio').files[0])takeAudioFile(el('fpAudio').files[0]);});
+document.addEventListener('dragover',e=>{e.preventDefault();el('dropAll').classList.add('on');});
+document.addEventListener('dragleave',()=>el('dropAll').classList.remove('on'));
+document.addEventListener('drop',async e=>{e.preventDefault();el('dropAll').classList.remove('on');
+  for(const fl of e.dataTransfer.files){
+    if(/\.json$/i.test(fl.name))await takeFile(fl);
+    else if(fl.type.startsWith('audio')||/\.(mp3|wav|ogg|flac|m4a)$/i.test(fl.name))await takeAudioFile(fl);}});
+el('btnPlay').addEventListener('click',()=>{M.playing=!M.playing;syncPanel();
+  if(audioEl){M.playing?audioEl.play().catch(()=>{}):audioEl.pause();}});
+el('btnRev').addEventListener('click',()=>{M.dir*=-1;syncPanel();if(audioEl&&M.dir<0)audioEl.pause();});
+el('btnReset').addEventListener('click',()=>{M.t=0;});
+el('scrub').addEventListener('input',e=>{if(M.f){M.playing=false;syncPanel();
+  M.t=e.target.value/1000*M.f.dur;if(audioEl)audioEl.pause();}});
+/* k 切层杆：只在画布上（逻辑坐标命中测试），切 k 只移动 ghost 层界 */
+cv.addEventListener('pointerdown',e=>{
+  const tf=window.__tf;if(!tf)return;
+  const r=cv.getBoundingClientRect();
+  const lx=((e.clientX-r.left)*tf.dpr-tf.ox)/tf.s, ly=((e.clientY-r.top)*tf.dpr-tf.oy)/tf.s;
+  if(ly<LEVY[0]-4||ly>LEVY[1]+4)return;
+  for(let k=0;k<4;k++)if(lx>=LEVELS[k]&&lx<=LEVELS[k]+44){M.ghostK=String([4,6,8,10][k]);return;}
+});
+
+/* ============================================================================
+   标注台交付包接收端（CONTRACT §5）：启动即监听，收到前一切照旧。
+   段落级机构 = 纸带上的沉积层（f.secs → secOf → 行程 P 整链重建）。
+   regions（confirmed 或 auto:false）优先于 features.structure.sections；
+   auto:true && !confirmed 只画琥珀点线＝显示，不进 driven_bounds＝不驱动；
+   无人工段 → 退回 sections 并写明"按自动分段（未经人工确认）"，且把自动分段登记进
+   driven_bounds（回退态也要有账）。sketch 真接：叠在对应人工段的沉积层上。
+   ========================================================================== */
+const DEVICE_ID='C';
+function updateSrcLine(){
+  const s=el('srcLine');if(!s)return;
+  if(!BUNDLE.received){s.style.display='none';return;}
+  s.style.display='block';
+  s.textContent='来自标注台 · '+(BUNDLE.project||'未命名')+' · 拍速 '+
+    (Number.isFinite(BUNDLE.bpm)?BUNDLE.bpm.toFixed(1):'未提供')+'（'+(BUNDLE.bpm_source||'自动')+'）'+
+    (BUNDLE.sec_mode==='sections-fallback'?' · 按自动分段（未经人工确认）':'');
+}
+const isHumanRegion=r=>!!r&&(r.confirmed===true||r.auto===false);
+function regionSections(regs,F){
+  const st=(F&&F.structure&&F.structure.sections)||[];
+  return regs.slice().sort((a,b)=>a.t0-b.t0).map(r=>{
+    const s={start:+r.t0||0,end:+r.t1||0,name:r.name||'',sketch:(r.sketch||[]).slice()};
+    let w=0;const acc={};for(const k of ['energy','bright','tension','noise','lowhigh','onset_per_s','novelty'])acc[k]=0;
+    for(const sc of st){const a=Math.max(s.start,sc.start),b=Math.min(s.end,sc.end);
+      if(b<=a)continue;w+=b-a;
+      for(const k in acc)if(Number.isFinite(sc[k]))acc[k]+=(b-a)*sc[k];}
+    if(w>0)for(const k in acc)s[k]=acc[k]/w;
+    s.bars=null;return s;});}
+function bundleDriven(F){
+  const st=(F&&F.structure&&F.structure.sections)||[];
+  const secs=BUNDLE.human_regions.length?regionSections(BUNDLE.human_regions,F):st;
+  BUNDLE.sec_mode=BUNDLE.human_regions.length?'regions':'sections-fallback';
+  applySections(M.f,secs);                     /* 真源重建：层界 / secOf / 行程 P 全吃有效段 */
+  BUNDLE.driven_bounds=secs.map(s=>[s.start,s.end]);
+  M.inks=[];let n=0;
+  for(const r of BUNDLE.human_regions){
+    const strokes=(r.sketch||[]).filter(st2=>st2&&Array.isArray(st2.pts)&&st2.pts.length>=2);
+    if(!strokes.length)continue;
+    M.inks.push({t0:+r.t0,t1:+r.t1,strokes});n+=strokes.length;}
+  BUNDLE.sketch_strokes=n;updateSrcLine();}
+function clearBundle(){
+  BUNDLE.received=false;BUNDLE.ack_sent=false;BUNDLE.sec_mode=null;
+  BUNDLE.driven_bounds=[];BUNDLE.suggestion_bounds=[];
+  BUNDLE.human_regions=[];BUNDLE.sugg_regions=[];BUNDLE.sketch_strokes=0;BUNDLE.human_bpm=false;
+  BUNDLE.error='';BUNDLE.project=null;BUNDLE.bpm=null;BUNDLE.bpm_source=null;M.inks=[];
+  updateSrcLine();}
+function applyBundle(b){
+  BUNDLE.received=true;BUNDLE.error='';
+  const pr=b.project||{};
+  BUNDLE.project=pr.name||'未命名';
+  BUNDLE.bpm=Number.isFinite(pr.bpm)?pr.bpm:null;
+  BUNDLE.bpm_source=pr.bpm_source||'自动';
+  BUNDLE.human_bpm=/^人工/.test(String(BUNDLE.bpm_source));
+  const regs=Array.isArray(b.regions)?b.regions.filter(r=>r&&Number.isFinite(+r.t0)&&Number.isFinite(+r.t1)):[];
+  BUNDLE.human_regions=regs.filter(isHumanRegion);
+  BUNDLE.sugg_regions=regs.filter(r=>!isHumanRegion(r));
+  BUNDLE.suggestion_bounds=BUNDLE.sugg_regions.map(r=>[+r.t0,+r.t1]);
+  loadFeatText(JSON.stringify(b.features||{}));   /* 与拖文件完全同一条处理路径 */
+  if(!M.f||!(M.f.fr>0))BUNDLE.error='bundle.features 无效（0 帧），层界退回自动分段';
+  try{bundleDriven(b.features||{});}
+  catch(e){BUNDLE.error=(BUNDLE.error?BUNDLE.error+' ':'')+'段落驱动异常 '+((e&&e.message)||e);}
+  if(!BUNDLE.driven_bounds.length&&BUNDLE.sec_mode==='sections-fallback')
+    BUNDLE.error=(BUNDLE.error?BUNDLE.error+' ':'')+'无可退自动分段（sections 为空）';}
+window.addEventListener('message',ev=>{const d=ev&&ev.data;
+  if(d&&d.kind==='annotator-audio'){if(d.buf){try{takeAudioFile(new File([d.buf],d.name||'来自标注台',{type:d.type}));}catch(e){}}return;}
+  if(!d||d.kind!=='annotator-bundle')return;
+  try{applyBundle(d);}catch(e){BUNDLE.error=String((e&&e.message)||e);}
+  if(ev.source){try{ev.source.postMessage({kind:'annotator-bundle-ack',device:DEVICE_ID},'*');
+    BUNDLE.ack_sent=true;}catch(e){BUNDLE.error=(BUNDLE.error?BUNDLE.error+' ':'')+'ack失败';}}});
+
+window.__M={
+  injectFeatText(s){loadFeatText(s);},
+  setTime(t){M.playing=false;if(audioEl)audioEl.pause();M.t=t;render(t);},
+  setK(k){M.ghostK=String(k);if(M.f)render(M.t);},
+  state(){return{t:M.t,dur:M.f?M.f.dur:0,frames:M.f?M.f.fr:0,fps:M.f?M.f.fps:0,raf:window.__raf|0};},
+  selftest(){return window.__SELFTEST__;},
+  bundleState(){return window.__BUNDLE__;},
+  snap(w,h){w=w||158;h=h||96;const c2=document.createElement('canvas');c2.width=w;c2.height=h;
+    const g=c2.getContext('2d');g.fillStyle='#000';g.fillRect(0,0,w,h);g.drawImage(cv,0,0,w,h);
+    const d=g.getImageData(0,0,w,h).data;const out=new Uint8Array(w*h);
+    for(let i=0,j=0;i<d.length;i+=4,j++)out[j]=(d[i]*77+d[i+1]*151+d[i+2]*28)>>8;return out.join(',');}};
+window.__SELFTEST__={device:'C-舞台优先',label_collisions:null};
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>D · 音符液压柱 · 共鸣槽</title>
+<style>
+:root{--bg:#070a0d;--ink:#dfe6ee;--dim:#8fa0b3;--amber:#ffb24d;--line:#2b333c}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;overflow:hidden}
+#stage{position:fixed;inset:0;width:100%;height:100%;display:block}
+#dock{position:fixed;left:50%;bottom:4px;transform:translateX(-50%);display:flex;align-items:center;gap:6px;
+  padding:3px 8px;border:1px solid #2b333c;border-radius:4px;background:rgba(9,12,16,.93);font-size:11.5px;
+  color:#93a5b8;white-space:nowrap;z-index:5}
+#dock button{font:inherit;font-size:11.5px;background:#141a20;color:#c3d0dd;border:1px solid #2b333c;border-radius:3px;
+  padding:2px 7px;cursor:pointer;line-height:1.35}
+#dock button:hover{border-color:#4a5665}
+#dock button.sel{border-color:#ffb24d;color:#ffb24d}
+#dock input[type=range]{width:190px;height:12px}
+#dock .tc{font-family:Consolas,monospace;color:#dfe6ee;font-size:11.5px}
+#dropAll{position:fixed;inset:0;pointer-events:none;border:2px solid transparent;z-index:9}
+#dropAll.on{border-color:#ffb24d}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="hud" style="display:none;position:fixed;left:0;right:0;top:0;z-index:10;height:34px;line-height:34px;padding:0 14px;background:#070a0d;border-bottom:1px solid #2b333c;font-size:14px;color:#ffb24d"></div>
+<div id="srcLine" style="display:none;position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)">数据源：未载入</div>
+<div id="dock">
+  <button id="btnPlay">▶ 走带</button>
+  <button id="btnReset">⟲ 归零</button>
+  <button id="btnRev">反转</button>
+  <input type="range" id="scrub" min="0" max="1000" value="0">
+  <span class="tc" id="tRead">0.00s</span>
+  <button id="btnTim">timeline</button>
+  <button id="btnFeat">features</button>
+  <button id="btnAudio">音频</button>
+</div>
+<input type="file" id="fpTim" hidden accept=".json">
+<input type="file" id="fpFeat" hidden accept=".json">
+<input type="file" id="fpAudio" hidden accept="audio/*">
+<div id="dropAll"></div>
+<script>
+"use strict";
+/* ============================================================================
+   H3 · 共鸣槽（舞台优先重排）
+   假设：D 那台之所以"差点意思"，是因为它本质是仪表盘 —— 会动的舞台只占约 1/5。
+   本件把 D 的同一批字段/语义原样搬进一个占画幅 78% 的水槽舞台；读数压成
+   顶部 88px、底部 110px 两条窄带 + 舞台上两枚悬浮 HUD，不删信息，只重排。
+   ---------------------------------------------------------------------------
+   色义（与 D 同表）：琥珀=未确认/降级；红=非倍半音真分歧（本机无此判定，不出现）；
+   其余中性冷色；melody/bass 靠实块/斜纹区分，不靠色相。
+   画面 = f(features/timeline, t)：无墙钟动画、无随机数；走带 t 只是输入口。
+   ========================================================================== */
+const C={bg:'#070a0d',ink:'#dfe6ee',hi:'#c3d0dd',mid:'#93a5b8',dim:'#6d7f92',faint:'#4a5665',
+  frame:'#39434f',plate:'#0b1015',plateEd:'#2b333c',amber:'#ffb24d',red:'#ff7b6e'};
+const FONT='Consolas,"Microsoft YaHei",monospace';
+const MINFONT=14;                         /* 逻辑字号下限：1280×720 letterbox 0.8 → 实际 11.2px ≥11 */
+const L={W:1600,H:900};
+/* 舞台 = 水槽整幅（x 0..1600, y 88..790）。占比 702*1600/900*1600 = 0.78 */
+const STAGE={x0:0,y0:88,x1:1600,y1:790};
+const TANK={x0:28,y0:96,x1:1572,y1:782};
+const ROLL={x0:150,y0:200,x1:1450,y1:440};
+const COLX=800,TUBE={x0:760,y0:132,x1:840,y1:734},WIN=18;
+const cv=document.getElementById('stage'),ctx=cv.getContext('2d');
+window.__BUNDLE__={received:false,ack_sent:false,project:null,bpm:null,bpm_source:null,human_bpm:false,
+  sec_mode:null,driven_bounds:[],suggestion_bounds:[],sketch_strokes:0,error:'',human_regions:[],sugg_regions:[]};
+const BUNDLE=window.__BUNDLE__;
+const M={t:0,playing:false,dir:1,speed:1,f:null,tim:null,segOverride:null,inks:[],err:''};
+let audioEl=null;
+const el=id=>document.getElementById(id);
+const b64u8=s=>{const b=atob(s),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;};
+const nz=(v,d)=>Number.isFinite(v)?v.toFixed(d):'未分析';
+const clamp01=v=>v<0?0:v>1?1:v;
+/* 上屏文本统一过 noell：数据原文里的 … / ... 一律换成 ·（屏幕永不出现省略号） */
+const noell=s=>String(s).replace(/…/g,'·').replace(/\.\.\./g,'·');
+const txt=v=>(v==null||v===''||v===undefined)?'未提供':noell(v);
+const hex=c=>/^#[0-9a-fA-F]{6}$/.test(String(c||''))?c:'#9fb4cc';
+
+function fitCanvas(){const r=cv.getBoundingClientRect(),d=Math.min(window.devicePixelRatio||1,2);
+  cv.width=Math.max(2,Math.round(r.width*d));cv.height=Math.max(2,Math.round(r.height*d));
+  const s=Math.min(cv.width/L.W,cv.height/L.H);
+  ctx.setTransform(s,0,0,s,(cv.width-L.W*s)/2,(cv.height-L.H*s)/2);window.__scale=s;}
+new ResizeObserver(fitCanvas).observe(cv);
+
+/* ================= 标签占位账本 label ledger（结构照抄 D） =================
+   任何 fillText 都经 LG.add 排队 → LG.flush 落笔；落笔前与已登记文字盒求交；
+   相交 → 挪位（8 方向×4 档）→ 缩字号（≥MINFONT）→ 仍无解则整条省略。
+   label_collisions = 真的相交还落笔的次数，必须为 0。                         */
+let LEDGER_PROBE={detected:0,clean:0,e2e:0,ok:false};
+const LG={
+  occ:[],q:[],st:null,bounds:{x0:0,y0:0,x1:L.W,y1:L.H},
+  reset(b){this.occ=[];this.q=[];this.bounds=b||{x0:0,y0:0,x1:L.W,y1:L.H};
+    this.st={checked:0,drawn:0,dropped:0,relocated:0,shrunk:0,collisions:0,overlap_events:0,geom:0,
+      ellipsis:0,nan:0,minfont:999};},
+  hit(a,b){return a.x0<b.x1&&b.x0<a.x1&&a.y0<b.y1&&b.y0<a.y1;},
+  block(x0,y0,x1,y1){this.occ.push({x0,y0,x1,y1,g:1});this.st.geom++;},
+  overlaps(r){let n=0;for(let k=0;k<this.occ.length;k++)if(this.hit(this.occ[k],r))n++;return n;},
+  box(x,y,t,s,align){ctx.save();ctx.font=s+'px '+FONT;const w=ctx.measureText(t).width;ctx.restore();
+    const h=s*1.3,x0=align==='center'?x-w/2:align==='right'?x-w:x;
+    return {x0:x0,y0:y-h/2,x1:x0+w,y1:y+h/2,w:w,h:h};},
+  add(prio,x,y,text,size,col,align,opt){this.q.push({prio:prio,x:x,y:y,text:String(text),
+    size:Math.max(MINFONT,size||MINFONT),col:col||C.mid,align:align||'left',opt:opt||{}});},
+  clamp(r){const b=this.bounds;let dx=0,dy=0;
+    if(r.x0<b.x0)dx=b.x0-r.x0; if(r.x1>b.x1)dx=b.x1-r.x1;
+    if(r.y0<b.y0)dy=b.y0-r.y0; if(r.y1>b.y1)dy=b.y1-r.y1;
+    return {x0:r.x0+dx,y0:r.y0+dy,x1:r.x1+dx,y1:r.y1+dy,w:r.w,h:r.h};},
+  note(s,t){this.st.minfont=Math.min(this.st.minfont,s);
+    if(/…|\.\.\./.test(t))this.st.ellipsis++;
+    if(/NaN|undefined|null|Infinity/.test(t))this.st.nan++;},
+  place(it){this.st.checked++;
+    const sizes=it.opt.noshrink?[it.size]:[it.size,Math.max(MINFONT,it.size*0.9),Math.max(MINFONT,it.size*0.82)];
+    const st=it.size*1.45;let offs=[[0,0]];
+    if(!it.opt.fixed){for(const rad of [1,2,3,5])for(const d of [[0,1],[0,-1],[1,0],[-1,0],[1,1],[-1,1],[1,-1],[-1,-1]])
+      offs.push([d[0]*st*rad*1.1,d[1]*st*rad]);}
+    for(let si=0;si<sizes.length;si++){const s=sizes[si];
+      for(let oi=0;oi<offs.length;oi++){
+        const r=this.clamp(this.box(it.x+offs[oi][0],it.y+offs[oi][1],it.text,s,it.align));
+        const n=this.overlaps(r);
+        if(n===0){if(si>0)this.st.shrunk++;if(oi>0)this.st.relocated++;
+          this.commit(r,it,s);this.occ.push(r);this.st.drawn++;this.note(s,it.text);return true;}
+        this.st.overlap_events+=n;}}
+    if(it.opt.must){const r=this.clamp(this.box(it.x,it.y,it.text,it.size,it.align));
+      this.st.collisions+=this.overlaps(r);this.commit(r,it,it.size);this.occ.push(r);this.st.drawn++;
+      this.note(it.size,it.text);return true;}
+    this.st.dropped++;this.st.drop_list=this.st.drop_list||[];
+    if(this.st.drop_list.length<6)this.st.drop_list.push(it.text);return false;},
+  commit(r,it,s){if(it.opt.plate){ctx.fillStyle=C.plate;ctx.fillRect(r.x0-3,r.y0-2,r.w+6,r.h+4);
+      ctx.strokeStyle=C.plateEd;ctx.lineWidth=1;ctx.strokeRect(r.x0-3,r.y0-2,r.w+6,r.h+4);}
+    ctx.fillStyle=it.col;ctx.font=s+'px '+FONT;ctx.textAlign=it.align;ctx.textBaseline='middle';
+    ctx.fillText(it.text,(it.align==='center')?(r.x0+r.x1)/2:(it.align==='right'?r.x1:r.x0),(r.y0+r.y1)/2);
+    ctx.textAlign='left';ctx.textBaseline='alphabetic';},
+  flush(){this.q.sort((a,b)=>a.prio-b.prio);for(let k=0;k<this.q.length;k++)this.place(this.q[k]);
+    window.__SELFTEST__={device:'H3-共鸣槽',stage_rect:[STAGE.x0,STAGE.y0,STAGE.x1,STAGE.y1],
+      stage_ratio:+(((STAGE.x1-STAGE.x0)*(STAGE.y1-STAGE.y0))/(L.W*L.H)).toFixed(4),
+      stage_hud_split:{stage_px:STAGE.y1-STAGE.y0,hud_px:L.H-(STAGE.y1-STAGE.y0)},
+      label_collisions:this.st.collisions,label_checked:this.st.checked,
+      label_drawn:this.st.drawn,label_dropped:this.st.dropped,label_relocated:this.st.relocated,
+      label_shrunk:this.st.shrunk,label_overlap_events:this.st.overlap_events,geom_kepts:this.st.geom,
+      label_ellipsis:this.st.ellipsis,nan_labels:this.st.nan,
+      min_drawn_font_px:this.st.drawn?Math.round(this.st.minfont*100)/100:null,
+      label_dropped_text:this.st.drop_list||[],
+      min_font_px:MINFONT,ledger_detect_synth:LEDGER_PROBE.detected,ledger_selftest_ok:LEDGER_PROBE.ok,
+      ledger_e2e_forced:LEDGER_PROBE.e2e,
+      scale_px:Math.round((window.__scale||1)*1000)/1000,
+      min_rendered_font_px:Math.round(MINFONT*(window.__scale||1)*100)/100,
+      sec_mode:window.__BUNDLE__.sec_mode||'',bundle_received:window.__BUNDLE__.received,
+      bundle:(function(b){return{received:b.received,ack_sent:b.ack_sent,sec_mode:b.sec_mode||'',
+        human:b.human_regions.length,sugg:b.sugg_regions.length,
+        driven:b.driven_bounds.map(x=>[x[0],x[1]]),suggestions:b.suggestion_bounds.map(x=>[x[0],x[1]]),
+        sketch_strokes:b.sketch_strokes,error:b.error};})(window.__BUNDLE__)};}
+};
+/* 账本自证（反假绿）：求交原语 1/0 + 端到端"同盒两标签"必须逼出挪位或省略 */
+LEDGER_PROBE=(function(){
+  LG.reset({x0:0,y0:0,x1:L.W,y1:L.H});
+  LG.occ.push(LG.box(120,120,'0000000000',16,'left'));
+  const same=LG.overlaps(LG.box(120,120,'0000000000',16,'left'));
+  const far=LG.overlaps(LG.box(900,500,'0000000000',16,'left'));
+  LG.reset({x0:0,y0:0,x1:L.W,y1:L.H});
+  LG.add(0,120,120,'ZZZZZZZZZZ',16,C.ink,'left');
+  LG.add(0,120,120,'ZZZZZZZZZZ',16,C.ink,'left');
+  LG.flush();
+  const e2e=LG.st.relocated+LG.st.dropped;
+  LG.reset();ctx.clearRect(0,0,L.W,L.H);
+  return {detected:same,clean:far,e2e:e2e,ok:(same===1&&far===0&&e2e>=1)};})();
+function label(prio,x,y,s,size,col,align,opt){LG.add(prio,x,y,s,size,col,align,opt);}
+/* 预置短名选档：pick 取第一条放得下的候选；lab 把选中的名字登记进账本。
+   一条都放不下 → 整条省略并计入 label_dropped；绝不出现带省略号的残名。 */
+function pick(cands,maxw,size){ctx.save();ctx.font=(size||MINFONT)+'px '+FONT;let t=null;
+  for(let k=0;k<cands.length;k++){const c=noell(cands[k]);
+    if(ctx.measureText(c).width<=maxw){t=c;break;}}
+  ctx.restore();return t;}
+function lab(prio,x,y,cands,maxw,size,col,align,opt){LG.st.checked++;
+  const t=pick(cands,maxw,size);
+  if(t===null){LG.st.dropped++;LG.st.drop_list=LG.st.drop_list||[];
+    const last=noell(cands[cands.length-1]);
+    if(LG.st.drop_list.length<6&&LG.st.drop_list.indexOf(last)<0)LG.st.drop_list.push(last);return;}
+  LG.add(prio,x,y,t,size,col,align,opt);}
+
+/* ================= 解码（与 D 同一口径） ================= */
+function decodeFeat(F){const src=F.source||{};const fr=src.frames|0,fps=src.fps||30,dur=src.duration||fr/fps;
+  const crv={};for(const k of ['rms','onset','flux','cent','rolloff','flatness','lowhigh','tension'])
+    crv[k]=(F.curves&&F.curves[k])?b64u8(F.curves[k]):null;
+  const acc=new Float64Array(fr);
+  if(crv.rms){let s=0;for(let i=0;i<fr;i++){s+=crv.rms[i]/255;acc[i]=s/(fps||30);}}
+  M.f={fr,fps,dur,crv,acc,name:src.name||'',rhythm:F.rhythm||null,meter:F.meter||null,
+    lyrics:F.lyrics||null,key:F.key||null,sections:(F.structure&&F.structure.sections)||[]};}
+function decodeTim(T){
+  const src=T.source||{};const dur=src.duration||0;
+  const ev={onset:[],beat:[],downbeat:[],note_on:[],note_off:[],pitch_bend:[]};
+  for(const e of (T.events||[]))if(ev[e.kind])ev[e.kind].push(e);
+  for(const k in ev)ev[k].sort((a,b)=>a.t-b.t);
+  const notes=(T.notes||[]).slice().sort((a,b)=>a.start-b.start);
+  const midis=notes.map(n=>n.midi).filter(Number.isFinite);
+  M.tim={raw:T,dur,ev,notes,midiLo:midis.length?Math.min.apply(null,midis):NaN,
+    midiHi:midis.length?Math.max.apply(null,midis):NaN,
+    rhythm:(T.features&&T.features.rhythm)||null,segments:T.segments||[],name:src.name||'',
+    rule:(T.features&&T.features.notes_rule)||null};}
+function durNow(){return (M.tim&&M.tim.dur)||(M.f&&M.f.dur)||0;}
+function activeNotes(t){if(!M.tim)return[];const out=[];
+  for(const n of M.tim.notes){if(n.start<=t&&t<n.end)out.push(n);if(n.start>t)break;}return out;}
+function countLE(arr,t,key){let a=0,b=arr.length;while(a<b){const m=(a+b)>>1;if((arr[m][key]||arr[m])<=t)a=m+1;else b=m;}return a;}
+
+/* ================= 绘图原件 ================= */
+function screw(x,y,r){ctx.strokeStyle=C.faint;ctx.lineWidth=1.2;ctx.beginPath();ctx.arc(x,y,r,0,7);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(x-r*0.7,y);ctx.lineTo(x+r*0.7,y);ctx.stroke();}
+function hairline(x0,y,x1){ctx.strokeStyle='#20272f';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x0,y);ctx.lineTo(x1,y);ctx.stroke();}
+
+/* 水下光斑纹理：一次性画好，逐帧按 ∫rms 滚动（比逐帧建渐变快，且无缝） */
+let CAUS=null;
+function buildCaustic(){
+  const w=1600,h=700,c=document.createElement('canvas');c.width=w;c.height=h;
+  const g=c.getContext('2d');
+  /* 焦散：一组细亮线（不是均匀雾），滚动时读作水面光网 */
+  for(let k=0;k<42;k++){
+    const base=k*700/42, ph=k*0.73;
+    g.beginPath();
+    for(let x=0;x<=w;x+=10){const y=base+6*Math.sin(x*0.005+ph)+2.5*Math.sin(x*0.013-ph*1.7);
+      x?g.lineTo(x,y):g.moveTo(x,y);}
+    g.strokeStyle='rgba(176,208,238,0.045)';g.lineWidth=8;g.stroke();
+    g.strokeStyle='rgba(196,222,248,0.16)';g.lineWidth=1.5;g.stroke();
+  }
+  /* 几束竖向反光（固定的，随画面水平漂移） */
+  for(let k=0;k<5;k++){
+    const x=170+k*320;
+    const lg=g.createLinearGradient(x-110,0,x+110,0);
+    lg.addColorStop(0,'rgba(150,180,210,0)');
+    lg.addColorStop(0.5,'rgba(150,180,210,0.05)');
+    lg.addColorStop(1,'rgba(150,180,210,0)');
+    g.fillStyle=lg;g.fillRect(x-110,0,220,h);
+  }
+  CAUS=c;
+}
+
+/* ================= 渲染（t 的纯函数） ================= */
+function syncHud(feat,tim,gridSig){
+  const h=el('hud');if(!h)return;
+  const msgs=[];
+  if(gridSig===false)msgs.push('拍网格不可信');
+  if(!tim)msgs.push('timeline 未装载');
+  const segs=M.segOverride||((tim&&tim.segments)||[]);
+  if(!segs.length)msgs.push('无分段数据');
+  if(msgs.length){h.textContent='降级 · '+msgs.join(' · ');h.style.display='block';}
+  else{h.style.display='none';h.textContent='';}
+}
+function render(t){
+  const tim=M.tim,feat=M.f;
+  LG.reset({x0:6,y0:6,x1:L.W-6,y1:L.H-6});
+  const dur=durNow();
+  const gridSig=tim?(tim.rhythm?tim.rhythm.grid_significant===true:null)
+    :(feat&&feat.rhythm?feat.rhythm.grid_significant===true:null);
+  syncHud(feat,tim,gridSig);
+  const fi=feat?Math.max(0,Math.min(feat.fr-1,Math.floor(t*feat.fps))):0;
+  const rms=feat&&feat.crv.rms?feat.crv.rms[fi]/255:0;
+  const cent=feat&&feat.crv.cent?feat.crv.cent[fi]/255:0;
+  const acc=feat&&feat.acc?feat.acc[fi]:0;
+  const act=tim?activeNotes(t):[];
+  const nOn=tim?countLE(tim.ev.note_on,t,'t'):0,nOff=tim?countLE(tim.ev.note_off,t,'t'):0;
+  const nOnArr=tim?tim.ev.note_on:null;
+  const pulse=(nOnArr&&nOn>0)?Math.max(0,1-(t-nOnArr[nOn-1].t)/0.30):0;
+
+  /* ---- 底 + 房间光（位置在槽底，亮度跟 rms 与 note_on 冲量） ---- */
+  ctx.fillStyle=C.bg;ctx.fillRect(0,0,L.W,L.H);
+  const rg=ctx.createRadialGradient(800,760,0,800,760,980);
+  rg.addColorStop(0,'rgba(126,158,196,'+(0.05+0.13*rms+0.10*pulse).toFixed(3)+')');
+  rg.addColorStop(1,'rgba(126,158,196,0)');
+  ctx.fillStyle=rg;ctx.fillRect(0,0,L.W,L.H);
+
+  /* ---- HUD 两条窄带的底板（读数带不属于舞台） ---- */
+  ctx.fillStyle='rgba(7,10,13,0.95)';ctx.fillRect(0,0,L.W,STAGE.y0);
+  ctx.fillStyle='rgba(7,10,13,0.97)';ctx.fillRect(0,STAGE.y1,L.W,L.H-STAGE.y1);
+  hairline(0,STAGE.y0-0.5,L.W);hairline(0,STAGE.y1+0.5,L.W);
+
+  /* ================= 舞台：液压柱（整根玻璃柱 = 音柱本体） =================
+     液位 ← notes.midi（绝对，min–max 定标）+ curves.rms（连续量托底）；
+     涟漪圆心 = 液面（半径 ∝ t−事件时刻）；水面倾角 ← pitch_bend；波纹 ← vibrato_depth。
+     谱面在后墙（透过玻璃柱可见），右缘=此刻。没有墙钟、没有随机数。      */
+  if(!CAUS)buildCaustic();
+  const lo=tim?tim.midiLo:NaN,hi=tim?tim.midiHi:NaN;
+  /* 当前活动音（strength 加权）——谱面亮行与液位共用同一个量 */
+  let midiNow0=NaN,cur0=null;
+  if(act.length){cur0=act[act.length-1];let ws=0,sum=0;
+    for(const n of act){sum+=(n.midi||0)*(n.strength||0.5);ws+=(n.strength||0.5);}
+    midiNow0=ws>0?sum/ws:NaN;}
+  const NEAR=TANK.y1-6;
+  const CX=COLX,RX=392,CTOP=112,CBOT=NEAR-2;
+  const frac0=tim?clamp01(0.12+((Number.isFinite(midiNow0)&&Number.isFinite(hi)&&hi>lo)?
+      (Math.max(lo,Math.min(hi,midiNow0))-lo)/(hi-lo):0)*0.50+clamp01(rms)*0.45)
+    :clamp01(0.10+(feat?cent:0)*0.80);
+  const WY=620-frac0*420;                        /* 液面 y：0.12→570，1→200 */
+  const IMP={x:CX,y:WY};
+
+  ctx.save();ctx.beginPath();ctx.rect(TANK.x0,TANK.y0,TANK.x1-TANK.x0,TANK.y1-TANK.y0);ctx.clip();
+  const wg0=ctx.createLinearGradient(0,TANK.y0,0,TANK.y1);
+  wg0.addColorStop(0,'rgba(18,25,33,1)');wg0.addColorStop(0.55,'rgba(11,16,22,1)');wg0.addColorStop(1,'rgba(14,20,27,1)');
+  ctx.fillStyle=wg0;ctx.fillRect(TANK.x0,TANK.y0,TANK.x1-TANK.x0,TANK.y1-TANK.y0);
+
+  /* ---- 后墙：音符记录鼓（右缘=此刻） ---- */
+  ctx.fillStyle='rgba(8,12,16,0.35)';ctx.fillRect(ROLL.x0,ROLL.y0,ROLL.x1-ROLL.x0,ROLL.y1-ROLL.y0);
+  ctx.strokeStyle='rgba(74,86,101,0.30)';ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(ROLL.x0,ROLL.y1);ctx.lineTo(ROLL.x1,ROLL.y1);ctx.stroke();
+  if(tim&&Number.isFinite(lo)){
+    if(hi<=lo)hi=lo+1;
+    const gw=ROLL.x1-ROLL.x0;
+    for(let m=Math.ceil(lo);m<=hi;m++){
+      const yy=ROLL.y1-((m-lo)/(hi-lo))*(ROLL.y1-ROLL.y0-10)-5;
+      ctx.strokeStyle=(m%12===0)?'rgba(120,140,160,0.13)':'rgba(120,140,160,0.04)';
+      ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(ROLL.x0,yy);ctx.lineTo(ROLL.x1,yy);ctx.stroke();}
+    for(let s=Math.ceil(t-WIN);s<=Math.floor(t);s++){
+      const x=ROLL.x1-(t-s)/WIN*gw;if(x<ROLL.x0)continue;
+      ctx.strokeStyle=(s%4===0)?'rgba(120,140,160,0.16)':'rgba(120,140,160,0.06)';ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo(x,ROLL.y0);ctx.lineTo(x,ROLL.y1);ctx.stroke();}
+    for(const n of tim.notes){
+      if(n.start>t)break;
+      const xa=ROLL.x1-(t-n.start)/WIN*gw, xb=ROLL.x1-(t-n.end)/WIN*gw;
+      if(xb<ROLL.x0)continue;
+      const x0=Math.max(ROLL.x0,xa),x1=Math.min(ROLL.x1,xb);
+      if(x1<=x0)continue;
+      const yy=ROLL.y1-((Math.max(lo,Math.min(hi,n.midi||lo))-lo)/(hi-lo))*(ROLL.y1-ROLL.y0-10)-5;
+      const isBass=n.voice==='bass',on=(n.start<=t&&t<n.end);
+      /* 音符下方垂一根"注水线"：谱面 → 槽底（半衰），把空墙读成器械 */
+      const tl=ctx.createLinearGradient(0,yy,0,ROLL.y1);
+      tl.addColorStop(0,isBass?'rgba(74,86,101,0.40)':'rgba(147,165,184,0.42)');
+      tl.addColorStop(1,'rgba(74,86,101,0)');
+      ctx.strokeStyle=tl;ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo((x0+x1)/2,yy+5);ctx.lineTo((x0+x1)/2,ROLL.y1);ctx.stroke();
+      ctx.fillStyle=isBass?C.faint:C.mid;ctx.globalAlpha=isBass?0.65:0.92;
+      ctx.fillRect(x0,yy-5,Math.max(2,x1-x0),10);ctx.globalAlpha=1;
+      if(isBass){ctx.strokeStyle='#0b0f13';ctx.lineWidth=1;
+        for(let q=x0;q<x1;q+=4){ctx.beginPath();ctx.moveTo(q,yy-5);ctx.lineTo(q+3,yy+5);ctx.stroke();}}
+      if(on){ctx.strokeStyle=C.hi;ctx.lineWidth=1.6;ctx.strokeRect(x0-1,yy-7,Math.max(3,x1-x0+2),14);}}
+    /* 当前音高行：一条随旋律走的亮行（连续线索，非事件） */
+    if(Number.isFinite(midiNow0)){
+      const yy=ROLL.y1-((Math.max(lo,Math.min(hi,midiNow0))-lo)/(hi-lo))*(ROLL.y1-ROLL.y0-10)-5;
+      const hg=ctx.createLinearGradient(ROLL.x0,0,ROLL.x1,0);
+      hg.addColorStop(0,'rgba(195,208,221,0)');hg.addColorStop(0.5,'rgba(195,208,221,0.10)');
+      hg.addColorStop(1,'rgba(195,208,221,0.16)');
+      ctx.fillStyle=hg;ctx.fillRect(ROLL.x0,yy-6,ROLL.x1-ROLL.x0,12);}
+    for(const s of (M.segOverride||tim.segments||[])){
+      const x1=ROLL.x1-(t-s.end)/WIN*gw;if(x1<ROLL.x0)continue;
+      const x0=Math.max(ROLL.x0,x1-(s.end-s.start)/WIN*gw);
+      ctx.strokeStyle='rgba(109,127,146,0.5)';ctx.setLineDash([2,5]);
+      ctx.beginPath();ctx.moveTo(x0,ROLL.y0+2);ctx.lineTo(x0,ROLL.y1-2);ctx.stroke();ctx.setLineDash([]);}
+    const gx=ctx.createLinearGradient(ROLL.x1-52,0,ROLL.x1,0);
+    gx.addColorStop(0,'rgba(255,178,77,0)');gx.addColorStop(1,'rgba(255,178,77,0.15)');
+    ctx.fillStyle=gx;ctx.fillRect(ROLL.x1-52,ROLL.y0,52,ROLL.y1-ROLL.y0);
+    ctx.strokeStyle=C.amber;ctx.lineWidth=2;ctx.beginPath();
+    ctx.moveTo(ROLL.x1,ROLL.y0);ctx.lineTo(ROLL.x1,ROLL.y1);ctx.stroke();
+  }
+
+  /* ---- 玻璃柱：柱体（半透明，把后墙谱面压暗一档 = 深度） ---- */
+  ctx.save();
+  ctx.beginPath();ctx.rect(CX-RX,CTOP,RX*2,CBOT-CTOP);ctx.clip();
+  const gl=ctx.createLinearGradient(CX-RX,0,CX+RX,0);
+  gl.addColorStop(0,'rgba(10,16,22,0.72)');gl.addColorStop(0.18,'rgba(14,22,30,0.34)');
+  gl.addColorStop(0.5,'rgba(14,22,30,0.26)');gl.addColorStop(0.82,'rgba(14,22,30,0.34)');
+  gl.addColorStop(1,'rgba(10,16,22,0.72)');
+  ctx.fillStyle=gl;ctx.fillRect(CX-RX,CTOP,RX*2,CBOT-CTOP);
+  /* 空腔辉光：液面往上的一团透射光（椭圆径向，随 rms 呼吸）
+     不是凭空的光源：房间光穿过玻璃落在水面上，强度仍绑 features.curves.rms */
+  if(WY>CTOP+6){
+    ctx.save();ctx.translate(CX,WY);ctx.scale(1,0.62);
+    const rgv=ctx.createRadialGradient(0,0,0,0,0,RX*0.98);
+    rgv.addColorStop(0,'rgba(202,226,250,'+(0.085+0.105*rms).toFixed(3)+')');
+    rgv.addColorStop(0.55,'rgba(190,216,242,'+(0.030+0.045*rms).toFixed(3)+')');
+    rgv.addColorStop(1,'rgba(190,216,242,0)');
+    ctx.fillStyle=rgv;ctx.beginPath();ctx.arc(0,0,RX*0.98,0,Math.PI*2);ctx.fill();
+    ctx.restore();}
+  /* 水体：液面 → 柱底 */
+  const wp=ctx.createLinearGradient(0,WY,0,CBOT);
+  wp.addColorStop(0,'rgba(150,184,216,'+(0.16+0.10*rms).toFixed(3)+')');
+  wp.addColorStop(0.10,'rgba(62,94,124,'+(0.44+0.14*rms).toFixed(3)+')');
+  wp.addColorStop(0.60,'rgba(18,31,44,0.86)');
+  wp.addColorStop(1,'rgba(8,15,22,0.94)');
+  ctx.fillStyle=wp;ctx.fillRect(CX-RX,WY,RX*2,CBOT-WY);
+  /* 水下光斑：只画在水里（相位=∫rms，数据清零即停） */
+  ctx.save();ctx.beginPath();ctx.rect(CX-RX,WY,RX*2,CBOT-WY);ctx.clip();
+  const off=(((acc*300)%700)+700)%700;
+  ctx.globalAlpha=Math.min(1,0.55+0.55*rms);
+  ctx.drawImage(CAUS,CX-RX+Math.sin(acc*1.7)*9,WY-150+off);
+  ctx.drawImage(CAUS,CX-RX+Math.sin(acc*1.7)*9,WY-150+off-700);
+  ctx.globalAlpha=1;
+  ctx.restore();
+  ctx.restore();
+
+  /* ---- 液面：一个大椭圆（透视压扁 0.10），倾角 ← pitch_bend ---- */
+  const bend=(()=>{if(!tim)return null;let r=null;
+    for(let q=Math.max(0,countLE(tim.ev.pitch_bend,t-0.35,'t')-1);q<tim.ev.pitch_bend.length;q++){
+      const e=tim.ev.pitch_bend[q];const dt=t-e.t;if(dt<0||dt>0.35)break;r=e;}return r;})();
+  const bf=(bend&&Number.isFinite(bend.midi_to)&&Number.isFinite(hi)&&hi>lo)?clamp01((bend.midi_to-lo)/(hi-lo)):0.5;
+  const tiltA=(bend?((bf-0.5)*2):0)*0.045;        /* 水面倾角 ±2.6 度 */
+  const vd=cur0&&Number.isFinite(cur0.vibrato_depth)?cur0.vibrato_depth:0;
+  const amp=Math.min(5,vd*0.18);
+  const ph=(t-(cur0?cur0.start:t))*2*Math.PI*5.5;
+  const RY=40+amp*1.2+Math.sin(ph)*amp*0.5;        /* 液面椭圆的短轴：随颤音呼吸 */
+  ctx.save();ctx.beginPath();ctx.rect(CX-RX-2,WY-90,RX*2+4,CBOT-WY+92);ctx.clip();
+  ctx.translate(CX,WY);ctx.rotate(tiltA);ctx.translate(-CX,-WY);
+  /* 液面盘 */
+  ctx.beginPath();ctx.ellipse(CX,WY,RX-1,RY,0,0,Math.PI*2);
+  const sg=ctx.createLinearGradient(0,WY-RY,0,WY+RY);
+  sg.addColorStop(0,'rgba(126,160,194,'+(0.30+0.16*rms).toFixed(3)+')');
+  sg.addColorStop(0.55,'rgba(168,200,230,'+(0.36+0.20*rms).toFixed(3)+')');
+  sg.addColorStop(1,'rgba(96,128,160,'+(0.22+0.12*rms).toFixed(3)+')');
+  ctx.fillStyle=sg;ctx.fill();
+  /* 涟漪：圆心=液面中心，半径∝t−事件时刻 */
+  if(tim){
+    const DEC=1.20;
+    const arrO=tim.ev.onset;
+    let q=Math.max(0,countLE(arrO,t-DEC,'t')-1);
+    for(;q<arrO.length;q++){const e=arrO[q];const dt=t-e.t;if(dt<0)break;if(dt>DEC)continue;
+      const pr=1-dt/DEC;
+      const rxd=dt/DEC*(150+210*(e.strength||0.5));
+      ctx.strokeStyle=e.band==='low'?C.dim:e.band==='mid'?C.mid:C.hi;
+      ctx.globalAlpha=Math.max(0.10,pr*0.75);ctx.lineWidth=1+1.8*pr*(e.strength||0.5);
+      ctx.beginPath();ctx.ellipse(CX,WY,Math.max(2,rxd),Math.max(1,rxd*0.10),0,0,Math.PI*2);ctx.stroke();
+      ctx.globalAlpha=1;}
+    if(gridSig!==false){
+      for(const k of ['beat','downbeat']){const arr=tim.ev[k];
+        let q2=Math.max(0,countLE(arr,t-DEC,'t')-1);
+        for(;q2<arr.length;q2++){const e=arr[q2];const dt=t-e.t;if(dt<0)break;if(dt>DEC)continue;
+          const pr=1-dt/DEC, rxd=dt/DEC*(k==='downbeat'?330:230);
+          ctx.strokeStyle=C.amber;ctx.globalAlpha=Math.max(0.08,pr*0.65);ctx.lineWidth=1+1.6*pr;
+          ctx.beginPath();ctx.ellipse(CX,WY,Math.max(2,rxd),Math.max(1,rxd*0.10),0,0,Math.PI*2);ctx.stroke();
+          ctx.globalAlpha=1;}}
+    }
+  }
+  /* 液面边缘：近缘亮、远缘暗（一条椭圆弧 = 水面的厚度） */
+  ctx.beginPath();ctx.ellipse(CX,WY,RX-1,RY,0,0,Math.PI*2);
+  ctx.strokeStyle='rgba(206,228,250,'+(0.50+0.35*rms).toFixed(3)+')';ctx.lineWidth=2;ctx.stroke();
+  ctx.beginPath();ctx.ellipse(CX,WY,RX-1,RY,0,0.15,Math.PI-0.15);
+  ctx.strokeStyle='rgba(230,242,255,0.85)';ctx.lineWidth=2.4;ctx.stroke();
+  /* 液面高光：一道横贯的反射 */
+  const rg3=ctx.createLinearGradient(CX-RX,0,CX+RX,0);
+  rg3.addColorStop(0,'rgba(220,238,255,0)');rg3.addColorStop(0.5,'rgba(220,238,255,0.10)');
+  rg3.addColorStop(1,'rgba(220,238,255,0)');
+  ctx.fillStyle=rg3;ctx.fillRect(CX-RX,WY-RY*0.4,RX*2,RY*0.8);
+  /* 落点亮斑：液面中心随 note_on 冲一下 */
+  const pulse0=pulse;
+  ctx.fillStyle='rgba(232,244,255,'+(0.35+0.45*pulse0).toFixed(3)+')';
+  ctx.beginPath();ctx.ellipse(CX,WY,26+16*pulse0,4.5+3*pulse0,0,0,Math.PI*2);ctx.fill();
+  ctx.restore();
+
+  /* ---- 柱壁：两道高光 + 顶圈 + 底圈 ---- */
+  ctx.strokeStyle='rgba(147,165,184,0.50)';ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(CX-RX,CTOP);ctx.lineTo(CX-RX,CBOT);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(CX+RX,CTOP);ctx.lineTo(CX+RX,CBOT);ctx.stroke();
+  ctx.strokeStyle='rgba(210,228,246,0.10)';ctx.lineWidth=7;
+  ctx.beginPath();ctx.moveTo(CX-RX+14,CTOP+10);ctx.lineTo(CX-RX+14,CBOT-6);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(CX+RX-10,CTOP+10);ctx.lineTo(CX+RX-10,CBOT-6);ctx.stroke();
+  /* 顶圈（能看到后半圈：玻璃管口） */
+  ctx.strokeStyle='rgba(147,165,184,0.55)';ctx.lineWidth=2;
+  ctx.beginPath();ctx.ellipse(CX,CTOP,RX,34,0,0,Math.PI*2);ctx.stroke();
+  ctx.strokeStyle='rgba(195,208,221,0.20)';ctx.lineWidth=6;
+  ctx.beginPath();ctx.ellipse(CX,CTOP,RX,34,0,0,Math.PI);ctx.stroke();
+  /* 底圈 */
+  ctx.strokeStyle='rgba(74,86,101,0.85)';ctx.lineWidth=2;
+  ctx.beginPath();ctx.ellipse(CX,CBOT,RX,40,0,0,Math.PI*2);ctx.stroke();
+  ctx.fillStyle='rgba(8,12,16,0.55)';
+  ctx.beginPath();ctx.ellipse(CX,CBOT,RX,40,0,0,Math.PI*2);ctx.fill();
+  /* 柱壁刻度：每 1/8 柱高一道短刻（量尺，不是标签） */
+  ctx.strokeStyle='rgba(147,165,184,0.34)';ctx.lineWidth=1;
+  for(let k=1;k<8;k++){const yy=CTOP+(CBOT-CTOP)*k/8;
+    ctx.beginPath();ctx.moveTo(CX+RX+2,yy);ctx.lineTo(CX+RX+10,yy);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(CX-RX-10,yy);ctx.lineTo(CX-RX-2,yy);ctx.stroke();}
+  /* 柱底两根进水管（把柱接进机器） */
+  ctx.strokeStyle='rgba(74,86,101,0.9)';ctx.lineWidth=7;ctx.lineJoin='round';
+  ctx.beginPath();ctx.moveTo(CX-RX,CBOT-8);ctx.lineTo(CX-RX-120,CBOT-8);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(CX+RX,CBOT-8);ctx.lineTo(CX+RX+120,CBOT-8);ctx.stroke();
+  ctx.strokeStyle='rgba(147,165,184,0.30)';ctx.lineWidth=1;
+  for(const px of [CX-RX-70,CX+RX+70]){ctx.beginPath();ctx.moveTo(px,CBOT-16);ctx.lineTo(px,CBOT);ctx.stroke();}
+  ctx.lineJoin='miter';
+
+  ctx.restore();
+
+  /* ---- 舞台外框（机器的边界） ---- */
+  ctx.strokeStyle=C.frame;ctx.lineWidth=2;ctx.strokeRect(TANK.x0,TANK.y0,TANK.x1-TANK.x0,TANK.y1-TANK.y0);
+  ctx.strokeStyle='#1b2229';ctx.lineWidth=1;ctx.strokeRect(TANK.x0+5,TANK.y0+5,TANK.x1-TANK.x0-10,TANK.y1-TANK.y0-10);
+  for(const p of [[TANK.x0+14,TANK.y0+14],[TANK.x1-14,TANK.y0+14],[TANK.x0+14,TANK.y1-14],[TANK.x1-14,TANK.y1-14]])
+    screw(p[0],p[1],4);
+
+
+  const midiNow=midiNow0,cur=cur0;
+  /* ================= 文字：顶部 HUD（读数带 1） ================= */
+  label(0,24,27,'D · 音符液压柱 · 共鸣槽',15,C.ink,'left',{fixed:true});
+  const song=(tim&&tim.name)||(feat&&feat.name)||null;
+  lab(0,24,52,[(song?noell(song):'未载入')+' · '+nz(feat?feat.dur:NaN,1)+'s · '+
+    (feat&&feat.rhythm?nz(feat.rhythm.bpm,2)+' BPM':'拍速未分析')+' · 30fps',
+    (song?noell(song):'未载入')+' · '+(feat?nz(feat.dur,1)+'s':'时长未提供')],760,12,C.dim,'left',{fixed:true});
+  lab(0,24,73,[tim?('timeline 已装载 · notes '+tim.notes.length+' / events '+(tim.raw.events||[]).length)
+    :'timeline 未装载 → 降级模式（单柱由 curves.cent 驱动）',
+    tim?('timeline 已装载 · notes '+tim.notes.length):'timeline 未装载 → 降级模式'],
+    470,11.5,tim?C.ink:C.amber,'left',{fixed:true});
+  lab(0,516,73,[gridSig===null?'grid_significant 未提供'
+      :('grid_significant='+(gridSig?'true':'false')+
+        (!tim?'（timeline 未装载 → 金圈无处可画）':(gridSig?'（金圈启用）':'（金圈停用，只画 onset）'))),
+    gridSig===null?'grid 未提供':('grid='+(gridSig?'true':'false'))],400,11.5,
+    (!tim||gridSig===false)?C.amber:C.ink,'left',{fixed:true});
+  lab(0,880,73,[tim?('melody '+tim.notes.filter(n=>(n.voice||'melody')==='melody').length+
+    ' / bass '+tim.notes.filter(n=>n.voice==='bass').length+'（0=该喷嘴无信号）'):'voice 通路未装载',
+    tim?('melody '+tim.notes.filter(n=>(n.voice||'melody')==='melody').length+' / bass '+
+      tim.notes.filter(n=>n.voice==='bass').length):'voice 未装载'],380,11.5,C.hi,'left',{fixed:true});
+  lab(0,1576,27,[('t '+t.toFixed(2)+' s / '+nz(dur,2)+' s'),('t '+t.toFixed(1)+' / '+nz(dur,1)+' s')],
+    260,15,C.hi,'right',{fixed:true});
+  lab(0,1576,52,[tim?('note_on '+nOn+' · note_off '+nOff+' · onset '+tim.ev.onset.length+
+    ' · beat '+tim.ev.beat.length+' · bend '+tim.ev.pitch_bend.length):'事件计数未装载',
+    tim?('note_on '+nOn+' · onset '+tim.ev.onset.length+' · beat '+tim.ev.beat.length):'事件计数未装载'],
+    460,11.5,C.dim,'right',{fixed:true});
+  lab(0,1576,73,[(feat&&feat.meter&&Number.isFinite(feat.meter.lufs_integrated)?'LUFS '+nz(feat.meter.lufs_integrated,2):'LUFS 未提供')+
+    ' · '+(feat&&feat.key&&feat.key.name?('key '+feat.key.name+' '+txt(feat.key.mode)):'调性不可定')+
+    ' · sections '+((feat&&feat.sections)?feat.sections.length:0)+
+    (feat&&feat.lyrics?(' · '+(feat.lyrics.found===true?'lyrics '+((feat.lyrics.lines||[]).length)+' 行':'lyrics found=false（无可用歌词）')):' · lyrics 未提供'),
+    (feat&&feat.key&&feat.key.name?('key '+feat.key.name):'调性不可定')],430,11.5,C.dim,'right',{fixed:true});
+
+  /* ---- 舞台标注：舞台/读数带的边界声明（这是实验件，量尺写在画面上） ---- */
+  lab(1,40,110,['舞台 78%（会动区域）· 读数带 22%'],240,11.5,C.dim,'left',{plate:true,fixed:true});
+
+  if(!tim&&!feat){
+    label(0,L.W/2,380,'机器静止：事件流与 features 均未装载。水柱不会凭空升降，涟漪不会凭空出现。',15,C.mid,'center',{fixed:true,must:true});
+    label(0,L.W/2,410,'装 timeline.json 为正常态；只装 features.json 则进降级模式（画面明标）。',13,C.dim,'center',{fixed:true});
+    LG.flush();el('tRead').textContent=t.toFixed(2)+'s';
+    el('scrub').value=0;syncPanel();return;}
+
+  /* ---- 记录鼓标注 ---- */
+  lab(1,168,190,['音符记录鼓（后墙谱面）· 18s 窗 · 实块=melody · 斜纹=bass','记录鼓 · 18s 窗 · 实块=melody · 斜纹=bass','记录鼓 18s'],
+    620,11.5,C.dim,'left',{fixed:true});
+  lab(1,1444,190,['此刻 →','→'],90,11.5,C.amber,'right',{fixed:true});
+  lab(1,40,190,['音高尺 midi','midi'],80,11.5,C.dim,'left',{fixed:true});
+  if(tim&&Number.isFinite(lo)){
+    for(let k=0;k<=6;k++){const mm=lo+(hi-lo)*k/6,yy=ROLL.y1-(ROLL.y1-ROLL.y0)*k/6;
+      ctx.strokeStyle='rgba(74,86,101,0.5)';ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo(ROLL.x0-6,yy);ctx.lineTo(ROLL.x0,yy);ctx.stroke();
+      label(3,ROLL.x0-10,yy,String(Math.round(mm)),11.5,C.dim,'right',{fixed:true});}
+  }else{
+    lab(2,ROLL.x0+10,ROLL.y0+18,['notes 未装载：鼓上不印任何东西','notes 未装载'],320,12,C.amber,'left');
+  }
+  /* 4 秒刻度（记录鼓上的时间尺，随走带左移） */
+  if(tim&&Number.isFinite(lo)){
+    for(let s=0;s<=Math.floor(t);s++){
+      if(s%4!==0)continue;const x=ROLL.x1-(t-s)/WIN*(ROLL.x1-ROLL.x0);
+      if(x<ROLL.x0+8||x>ROLL.x1-8)continue;
+      lab(3,x,ROLL.y0+12,[(s-t).toFixed(0)+'s'],54,11.5,C.dim,'center',{fixed:true});}
+  }
+
+  /* ---- 水体通道标注：三层 onset（图例钉在槽左下，不追液面——追液面会在高水位时
+       撞上 y456/478 的两枚悬浮 HUD，把"数据源/音柱"两行挤掉） ---- */
+  lab(2,TANK.x0+12,700,[tim?'onset 涟漪（低/中/高）：半径 ∝ t−事件时刻':'涟漪：未装载 timeline'],
+    300,11.5,C.dim,'left',{plate:true,fixed:true});
+  lab(2,TANK.x1-12,NEAR-18,[tim?(gridSig===false?'网格不可信 → beat/downbeat 金圈停用':'金圈 = beat/downbeat 事件（琥珀）'):'涟漪：未装载 timeline',
+    gridSig===false?'beat/downbeat 金圈停用':'金圈 = beat/downbeat'],400,11.5,
+    (!tim||gridSig===false)?C.amber:C.dim,'right',{fixed:true});
+
+  /* ---- 未确认建议：显示但不驱动（契约 §5：auto && !confirmed 只是建议） ---- */
+  const sugB=BUNDLE.suggestion_bounds||[];
+  if(sugB.length){
+    const list=sugB.slice(0,3).map(b=>(+b[0]).toFixed(1)+'–'+(+b[1]).toFixed(1)+'s').join(' / ');
+    lab(2,TANK.x0+10,TANK.y1-14,[
+      '未确认建议 '+sugB.length+' 段（仅显示·不驱动）：'+list+(sugB.length>3?' 等':''),
+      '未确认建议 '+sugB.length+' 段（仅显示·不驱动）'],
+      520,11.5,C.amber,'left',{plate:true,fixed:true});
+  }
+
+  /* ---- 悬浮 HUD（舞台上，两枚） ---- */
+  /* 静默≠未分析：没有活动音符时写"静默"并交代液位来自 curves.rms，不写"未分析" */
+  const midiHead=Number.isFinite(midiNow)?('音柱 midi '+nz(midiNow,1)):'音柱 静默（无活动音符·液位托底 curves.rms）';
+  lab(2,168,456,[
+    midiHead+(act.length>1?('（'+act.length+' 音叠合）'):'')+
+      ' · glide '+((cur&&Number.isFinite(cur.glide_cents))?nz(cur.glide_cents,1)+' 分':'静默')+
+      ' · 颤 '+(Number.isFinite(vd)?nz(vd,1):'静默')+' · 叠合 '+act.length,
+    midiHead+' · glide '+((cur&&Number.isFinite(cur.glide_cents))?nz(cur.glide_cents,1)+' 分':'静默')+
+      ' · 叠合 '+act.length,
+    midiHead+' · 叠合 '+act.length],
+    620,12.5,Number.isFinite(midiNow)?C.hi:C.amber,'left',{plate:true,fixed:true});
+  lab(2,168,478,[BUNDLE.received?('来自标注台 · '+noell(String(BUNDLE.project))+' · 拍速 '+
+    (Number.isFinite(BUNDLE.bpm)?nz(BUNDLE.bpm,1):'未提供')+'（'+noell(String(BUNDLE.bpm_source))+'）'
+    +(BUNDLE.sec_mode==='regions'?' · 人工段 '+BUNDLE.human_regions.length+' 段驱动'
+      :' · 按自动分段（未经人工确认）')):'数据源：未载入（可拖入 timeline / features）',
+    BUNDLE.received?('来自标注台 · '+noell(String(BUNDLE.project))):'数据源：未载入'],
+    640,11.5,BUNDLE.received?(BUNDLE.sec_mode==='sections-fallback'?C.amber:C.hi):C.dim,'left',{plate:true,fixed:true});
+  lab(2,1414,456,[(bend?('pitch_bend '+nz(bend.midi,0)+' → '+nz(bend.midi_to,0)+'（最近 0.35s）'):'pitch_bend：0.35s 内无事件')
+    +(act.length?'':'; 静默：无活动音符'),
+    (bend?('pitch_bend '+nz(bend.midi,0)+' → '+nz(bend.midi_to,0)):'pitch_bend 无事件')+(act.length?'':' · 静默'),
+    bend?'pitch_bend 有动作':'pitch_bend 无事件'],
+    420,12.5,bend?C.hi:C.amber,'right',{plate:true,fixed:true});
+
+  /* ================= 读数带 2：段条 + 两行注脚 ================= */
+  const segs=M.segOverride||((tim&&tim.segments.length)?tim.segments:[]);
+  const segDur=(tim&&tim.dur>0)?tim.dur:durNow();
+  const SG={x0:300,x1:1400,y0:797,y1:815};
+  ctx.strokeStyle=C.frame;ctx.lineWidth=1;ctx.strokeRect(SG.x0,SG.y0,SG.x1-SG.x0,SG.y1-SG.y0);
+  if(segs.length&&segDur>0){
+    for(const s of segs){
+      const xa=SG.x0+clamp01(s.start/segDur)*(SG.x1-SG.x0),xb=SG.x0+clamp01(s.end/segDur)*(SG.x1-SG.x0);
+      const en=Number.isFinite(s.energy)?clamp01(s.energy):0;
+      const h=en*(SG.y1-SG.y0-4);
+      ctx.fillStyle=C.mid;ctx.globalAlpha=0.30+0.50*(Number.isFinite(s.bright)?clamp01(s.bright):0);
+      ctx.fillRect(xa+1,SG.y1-2-h,Math.max(1,xb-xa-2),h);ctx.globalAlpha=1;
+      ctx.strokeStyle='rgba(74,86,101,0.8)';ctx.lineWidth=1;
+      ctx.strokeRect(xa+1,SG.y1-2-h,Math.max(1,xb-xa-2),h);
+      if(xb-xa>64){lab(3,(xa+xb)/2,SG.y1-6,['E'+nz(en,2)],70,11.5,C.dim,'center',{fixed:true});}}
+    /* 人工笔迹：画在对应段的 x 区间里（sketch 0–1 归一） */
+    for(const ink of M.inks){
+      const xa=SG.x0+clamp01(ink.t0/segDur)*(SG.x1-SG.x0),xb=SG.x0+clamp01(ink.t1/segDur)*(SG.x1-SG.x0);
+      for(const st of ink.strokes){
+        const pts=(st.pts||[]).filter(p=>Array.isArray(p)&&p.length>=2);
+        if(pts.length<2)continue;
+        ctx.strokeStyle=hex(st.c);ctx.lineWidth=Math.max(0.8,Math.min(3,(Number.isFinite(st.w)?st.w:2)*0.6));
+        ctx.beginPath();
+        pts.forEach((p,i)=>{const x=xa+clamp01(+p[0])*(xb-xa),y=SG.y0+2+clamp01(+p[1])*(SG.y1-SG.y0-4);
+          i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+        ctx.stroke();}}
+    /* 未确认建议（auto && !confirmed）：只在段条上描琥珀虚框 = 显示，不进 segs = 不驱动。
+       它们的边界另记在 __BUNDLE__.suggestion_bounds，永不混进 driven_bounds。 */
+    const sg=BUNDLE.suggestion_bounds||[];
+    for(const b of sg){
+      const xa=SG.x0+clamp01(+b[0]/segDur)*(SG.x1-SG.x0),xb=SG.x0+clamp01(+b[1]/segDur)*(SG.x1-SG.x0);
+      ctx.save();ctx.setLineDash([3,3]);ctx.strokeStyle=C.amber;ctx.lineWidth=1;
+      ctx.globalAlpha=0.85;ctx.strokeRect(xa+1.5,SG.y0+2.5,Math.max(2,xb-xa-3),SG.y1-SG.y0-5);
+      ctx.globalAlpha=1;ctx.restore();}
+    const cx=SG.x0+clamp01(t/segDur)*(SG.x1-SG.x0);
+    ctx.strokeStyle=C.amber;ctx.lineWidth=1.6;
+    ctx.beginPath();ctx.moveTo(cx,SG.y0-2);ctx.lineTo(cx,SG.y1+2);ctx.stroke();
+  }else{
+    lab(2,SG.x0+8,SG.y0+9,['segments 未提供（未装载或数组为空）','segments 未提供'],340,11.5,C.amber,'left');
+  }
+  const sgN=(BUNDLE.suggestion_bounds||[]).length;
+  lab(1,24,806,[BUNDLE.received?(BUNDLE.sec_mode==='regions'
+      ?('段条：人工段 '+BUNDLE.human_regions.length+' 段（regions 驱动）'+(sgN?' · 建议 '+sgN+' 段仅显示':''))
+      :('段条：自动分段 '+(segs.length?segs.length+' 段':'0 段')+'（未经人工确认）'+(sgN?' · 建议 '+sgN+' 段仅显示':'')))
+      :'段条：segments[].energy（归一）',
+    BUNDLE.received?(BUNDLE.sec_mode==='regions'?'段条：人工段（regions 驱动）':'段条：自动分段（未经人工确认）')
+      :'段条：segments energy'],
+    300,11.5,(BUNDLE.received&&BUNDLE.sec_mode==='sections-fallback')?C.amber:C.dim,'left',{fixed:true});
+  lab(1,1414,806,['当前第 '+segIdx(segs,t,segDur)+' 段 / 共 '+segs.length+' 段（bars 不可计）',
+    '第 '+segIdx(segs,t,segDur)+' / '+segs.length+' 段'],180,11.5,C.dim,'right',{fixed:true});
+
+  /* ---- 注脚 1：降级语义（三档，按优先级；琥珀=降级） ----
+     no-timeline：事件机构根本没有输入，只剩曲线托底；
+     grid-untrusted：有事件但拍网格过不了显著性，金圈停用（不补格）；
+     silent：器材正常、此刻就是没有活动音符——这是音乐，不是故障。 */
+  const deg=!tim?'no-timeline':(gridSig===false?'grid-untrusted':(act.length===0?'silent':'ok'));
+  const stTxt=deg==='no-timeline'
+    ? '降级 · timeline 未装载：液位只由 features.curves.cent/rms（归一）驱动；涟漪/金圈/记录鼓/bend 全部停转'
+    :deg==='grid-untrusted'
+    ? '降级 · 网格不可信（grid_significant=false）：beat/downbeat 金圈停用，只画 onset 涟漪；不按 120 BPM 补格'
+    :deg==='silent'
+    ? '正常态 · 此刻静默：无活动音符 —— 液位由 curves.rms 托底，记录鼓不印未来音符，金圈只在事件出现时亮'
+    :'正常态：涟漪半径 ∝ t−事件时刻 · 记录鼓只印 start ≤ t 的音符 · 事件清零则水面平静';
+  const stTxtS=deg==='no-timeline'?'降级 · timeline 未装载（curves.cent 托底）'
+    :deg==='grid-untrusted'?'降级 · 网格不可信（金圈停用）'
+    :deg==='silent'?'正常态 · 此刻静默（无活动音符）':'正常态：涟漪 ∝ t−事件时刻';
+  lab(1,24,834,[stTxt,stTxtS],840,12,deg==='ok'?C.hi:C.amber,'left',{fixed:true});
+  lab(1,1576,834,[tim?('活动音符 '+act.length+' · 叠合 '+(act.length?(cur?nz(cur.midi,0):'0'):'0')+
+    ' · 段 '+segs.length+' · note_on '+nOn+' ≤ t'):'活动音符 未装载',
+    tim?('活动 '+act.length+' · note_on '+nOn):'活动音符 未装载'],420,11.5,C.dim,'right',{fixed:true});
+
+  /* ---- 注脚 2：口径（midi 定标 / voice 判据 / 段读数 / 色义） ---- */
+  const ruleTxt=tim?(tim.rule?'voice 判据 notes_rule 启发式（非乐器识别）':'无 notes_rule：voice 为占位默认值')
+    :'voice 判据未装载';
+  lab(1,24,856,[
+    'midi 定标 '+((tim&&Number.isFinite(lo))?(nz(lo,0)+'–'+nz(hi,0)+'（全曲 min–max，跨曲不可比）'):'未装载')+
+      ' · '+ruleTxt+' · 段读数=段内均值',
+    'midi 定标 '+((tim&&Number.isFinite(lo))?(nz(lo,0)+'–'+nz(hi,0)):'未装载')+' · '+ruleTxt,
+    'midi 定标 '+((tim&&Number.isFinite(lo))?(nz(lo,0)+'–'+nz(hi,0)):'未装载')+' · notes_rule 启发式'],
+    900,11.5,C.dim,'left',{fixed:true});
+  lab(1,1576,856,['琥珀=未确认/降级 · 红=非倍半音真分歧（本机无该判定）· 冷色=已确认读数',
+    '琥珀=未确认/降级 · 冷色=已确认'],430,11.5,C.dim,'right',{fixed:true});
+
+  LG.flush();
+  el('tRead').textContent=t.toFixed(2)+'s';
+  el('scrub').value=Math.round(t/Math.max(1e-6,durNow())*1000);
+  syncPanel();
+}
+function segIdx(segs,t,dur){let k=0;for(let i=0;i<segs.length;i++)if(t>=segs[i].start)k=i;return segs.length?k+1:0;}
+function syncPanel(){
+  const s=window.__SELFTEST__||{};
+  el('btnPlay').textContent=M.playing?'⏸ 走带':'▶ 走带';
+  el('btnRev').className=M.dir<0?'sel':'';
+  /* 自检数字也进 DOM：投影时可直接读（不下发画布账本，避免二次登记） */
+  document.body.title='相交='+s.label_collisions+' 登记='+s.label_checked+' 省略号='+s.label_ellipsis+
+    ' 最小字号='+s.min_drawn_font_px+' 舞台='+s.stage_ratio;
+}
+
+/* ================= 走带 / 装载 ================= */
+function renderIdle(){
+  LG.reset({x0:6,y0:6,x1:L.W-6,y1:L.H-6});
+  ctx.fillStyle=C.bg;ctx.fillRect(0,0,L.W,L.H);
+  ctx.fillStyle='rgba(7,10,13,0.95)';ctx.fillRect(0,0,L.W,STAGE.y0);
+  ctx.fillStyle='rgba(7,10,13,0.97)';ctx.fillRect(0,STAGE.y1,L.W,L.H-STAGE.y1);
+  hairline(0,STAGE.y0-0.5,L.W);hairline(0,STAGE.y1+0.5,L.W);
+  ctx.fillStyle='rgba(14,20,26,1)';ctx.fillRect(TANK.x0,TANK.y0,TANK.x1-TANK.x0,TANK.y1-TANK.y0);
+  ctx.strokeStyle=C.frame;ctx.lineWidth=2;ctx.strokeRect(TANK.x0,TANK.y0,TANK.x1-TANK.x0,TANK.y1-TANK.y0);
+  label(0,24,27,'D · 音符液压柱 · 共鸣槽',15,C.ink,'left',{fixed:true});
+  label(0,24,52,'未载入 · 等待 timeline / features',12,C.dim,'left',{fixed:true});
+  label(0,24,73,'timeline 未装载 → 降级模式（单柱由 curves.cent 驱动）',11.5,C.amber,'left',{fixed:true});
+  label(0,L.W/2,380,'机器静止：事件流与 features 均未装载。水柱不会凭空升降，涟漪不会凭空出现。',15,C.mid,'center',{fixed:true,must:true});
+  label(0,L.W/2,410,'装 timeline.json 为正常态；只装 features.json 则进降级模式（画面明标）。',13,C.dim,'center',{fixed:true});
+  label(0,40,116,'舞台 78%（会动区域）· 读数带 22%',11.5,C.dim,'left',{plate:true,fixed:true});
+  label(0,L.W-24,852,'琥珀=未确认/降级 · 冷色=已确认读数',11.5,C.dim,'right',{fixed:true});
+  LG.flush();syncPanel();
+}
+function loop(now){window.__raf=(window.__raf|0)+1;
+  if(!loop.last)loop.last=now;const dt=Math.min(0.05,(now-loop.last)/1000);loop.last=now;
+  if(M.tim||M.f){if(audioEl&&!audioEl.paused&&M.dir>0)M.t=audioEl.currentTime;
+    else if(M.playing){const d=durNow();M.t+=dt*M.speed*M.dir;if(M.t<0){M.t=0;M.dir=1;}if(M.t>d)M.t=0;}
+    render(M.t);}else renderIdle();
+  requestAnimationFrame(loop);}
+function loadFeatText(s){try{decodeFeat(JSON.parse(s));el('btnFeat').textContent='✔ features';el('btnFeat').className='sel';}
+  catch(e){M.err=String(e&&e.message||e);el('btnFeat').textContent='features 解析失败';el('btnFeat').className='';}}
+function loadTimText(s){try{decodeTim(JSON.parse(s));M.t=0;el('btnTim').textContent='✔ timeline';el('btnTim').className='sel';}
+  catch(e){M.err=String(e&&e.message||e);el('btnTim').textContent='timeline 解析失败';el('btnTim').className='';}}
+async function takeFile(fl){clearBundle();const txtc=await fl.text();let j;
+  try{j=JSON.parse(txtc);}catch(e){return;}
+  if(j.events||j.notes){decodeTim(j);M.t=0;el('btnTim').textContent='✔ '+fl.name;el('btnTim').className='sel';}
+  else if(j.bands&&j.source){decodeFeat(j);el('btnFeat').textContent='✔ '+fl.name;el('btnFeat').className='sel';}}
+async function takeAudioFile(fl){audioEl=audioEl||new Audio();audioEl.src=URL.createObjectURL(fl);
+  el('btnAudio').textContent='音频：'+noell(fl.name);el('btnAudio').className='sel';
+  audioEl.play().catch(()=>{el('btnAudio').textContent='音频：被浏览器拦住 · 点画面出声';
+    document.addEventListener('pointerdown',()=>{audioEl&&audioEl.play().catch(()=>{});},{once:true});});}
+el('btnTim').addEventListener('click',()=>el('fpTim').click());
+el('fpTim').addEventListener('change',()=>{if(el('fpTim').files[0])takeFile(el('fpTim').files[0]);});
+el('btnFeat').addEventListener('click',()=>el('fpFeat').click());
+el('fpFeat').addEventListener('change',()=>{if(el('fpFeat').files[0])takeFile(el('fpFeat').files[0]);});
+el('btnAudio').addEventListener('click',()=>el('fpAudio').click());
+el('fpAudio').addEventListener('change',()=>{if(el('fpAudio').files[0])takeAudioFile(el('fpAudio').files[0]);});
+document.addEventListener('dragover',e=>{e.preventDefault();el('dropAll').classList.add('on');});
+document.addEventListener('dragleave',()=>el('dropAll').classList.remove('on'));
+document.addEventListener('drop',async e=>{e.preventDefault();el('dropAll').classList.remove('on');
+  for(const fl of e.dataTransfer.files){
+    if(/\.json$/i.test(fl.name))await takeFile(fl);
+    else if(fl.type.startsWith('audio')||/\.(mp3|wav|ogg|flac|m4a)$/i.test(fl.name))await takeAudioFile(fl);}});
+el('btnPlay').addEventListener('click',()=>{M.playing=!M.playing;syncPanel();
+  if(audioEl){M.playing?audioEl.play().catch(()=>{}):audioEl.pause();}});
+el('btnRev').addEventListener('click',()=>{M.dir*=-1;syncPanel();if(audioEl&&M.dir<0)audioEl.pause();});
+el('btnReset').addEventListener('click',()=>{M.t=0;});
+el('scrub').addEventListener('input',e=>{if(M.f||M.tim){M.playing=false;syncPanel();
+  M.t=e.target.value/1000*durNow();if(audioEl)audioEl.pause();}});
+
+/* ============================================================================
+   标注台交付包接收端（CONTRACT §5）：启动即监听，收到前一切照旧。
+   H3 的段落级机构 = 底部段条。bundle.regions（confirmed 或 auto:false）优先于
+   features.structure.sections；无人工段退回 sections 并写明"未经人工确认"。
+   sketch 笔迹这次真接：画在段条对应时间区间里，sketch_strokes 只报真画出的笔数。
+   ========================================================================== */
+const DEVICE_ID='D';
+function updateSrcLine(){
+  const s=el('srcLine');if(!s)return;
+  if(!BUNDLE.received){s.style.display='none';return;}
+  s.style.display='block';
+  s.textContent='来自标注台 · '+(BUNDLE.project||'未命名')+' · 拍速 '+
+    (Number.isFinite(BUNDLE.bpm)?BUNDLE.bpm.toFixed(1):'未提供')+'（'+(BUNDLE.bpm_source||'自动')+'）'+
+    (BUNDLE.sec_mode==='sections-fallback'?' · 按自动分段（未经人工确认）':'');
+}
+const isHumanRegion=r=>!!r&&(r.confirmed===true||r.auto===false);
+function regionSections(regs,F){
+  const st=(F&&F.structure&&F.structure.sections)||[];
+  return regs.slice().sort((a,b)=>a.t0-b.t0).map(r=>{
+    const s={start:+r.t0||0,end:+r.t1||0,name:r.name||''};
+    let w=0;const accv={energy:0,bright:0};
+    for(const sc of st){const a=Math.max(s.start,sc.start),b=Math.min(s.end,sc.end);
+      if(b<=a)continue;w+=b-a;
+      for(const k in accv)if(Number.isFinite(sc[k]))accv[k]+=(b-a)*sc[k];}
+    if(w>0)for(const k in accv)s[k]=accv[k]/w;
+    s.bars=null;return s;});}
+function bundleDriven(F){
+  const st=(F&&F.structure&&F.structure.sections)||[];
+  const secs=BUNDLE.human_regions.length?regionSections(BUNDLE.human_regions,F):st;
+  /* 只有人工段（confirmed‖auto:false）能当"真值"驱动段条；未确认建议永不进这里 */
+  BUNDLE.sec_mode=BUNDLE.human_regions.length?'regions':'sections-fallback';
+  M.segOverride=secs.length?secs.map(s=>({start:+s.start,end:+s.end,
+    energy:Number.isFinite(s.energy)?s.energy:NaN,bright:Number.isFinite(s.bright)?s.bright:NaN})):null;
+  /* driven_bounds = 真正在驱动段条的边界。回退态也要登记自动分段，别留空 */
+  BUNDLE.driven_bounds=M.segOverride?M.segOverride.map(s=>[s.start,s.end]):[];
+  /* 笔迹：只接人工段里的；没接到就是 0，绝不报假数 */
+  M.inks=[];let n=0;
+  for(const r of BUNDLE.human_regions){
+    const strokes=(r.sketch||[]).filter(st=>st&&Array.isArray(st.pts)&&st.pts.length>=2);
+    if(!strokes.length)continue;
+    M.inks.push({t0:+r.t0,t1:+r.t1,strokes});n+=strokes.length;}
+  BUNDLE.sketch_strokes=n;updateSrcLine();}
+function clearBundle(){
+  BUNDLE.received=false;BUNDLE.ack_sent=false;BUNDLE.sec_mode=null;
+  BUNDLE.driven_bounds=[];BUNDLE.suggestion_bounds=[];
+  BUNDLE.human_regions=[];BUNDLE.sugg_regions=[];BUNDLE.sketch_strokes=0;BUNDLE.human_bpm=false;
+  BUNDLE.error='';BUNDLE.project=null;BUNDLE.bpm=null;BUNDLE.bpm_source=null;
+  M.segOverride=null;M.inks=[];updateSrcLine();}
+function applyBundle(b){
+  BUNDLE.received=true;BUNDLE.error='';
+  const pr=b.project||{};
+  BUNDLE.project=pr.name||'未命名';
+  BUNDLE.bpm=Number.isFinite(pr.bpm)?pr.bpm:null;
+  BUNDLE.bpm_source=pr.bpm_source||'自动';
+  BUNDLE.human_bpm=/^人工/.test(String(BUNDLE.bpm_source));
+  const regs=Array.isArray(b.regions)?b.regions.filter(r=>r&&Number.isFinite(+r.t0)&&Number.isFinite(+r.t1)):[];
+  BUNDLE.human_regions=regs.filter(isHumanRegion);
+  BUNDLE.sugg_regions=regs.filter(r=>!isHumanRegion(r));
+  BUNDLE.suggestion_bounds=BUNDLE.sugg_regions.map(r=>[+r.t0,+r.t1]);
+  loadFeatText(JSON.stringify(b.features||{}));   /* 与拖文件完全同一条处理路径 */
+  if(!M.f||!(M.f.fr>0))BUNDLE.error='bundle.features 无效（0 帧），段条退回自动分段';
+  try{bundleDriven(b.features||{});}
+  catch(e){BUNDLE.error=(BUNDLE.error?BUNDLE.error+' ':'')+'段落驱动异常 '+((e&&e.message)||e);}
+  if(!BUNDLE.driven_bounds.length&&BUNDLE.sec_mode==='sections-fallback')
+    BUNDLE.error=(BUNDLE.error?BUNDLE.error+' ':'')+'无可退自动分段（sections 为空）';}
+window.addEventListener('message',ev=>{const d=ev&&ev.data;
+  /* 网页版播放壳在 iframe 里，file:// 下拿不到 contentWindow：timeline 也走一条消息 */
+  if(d&&d.kind==='annotator-timeline'){if(typeof d.text==='string'){try{loadTimText(d.text);}catch(e){BUNDLE.error=(BUNDLE.error?BUNDLE.error+' ':'')+'timeline 解析失败 '+((e&&e.message)||e);}}return;}
+  if(d&&d.kind==='annotator-audio'){if(d.buf){try{takeAudioFile(new File([d.buf],d.name||'来自标注台',{type:d.type}));}catch(e){}}return;}
+  if(!d||d.kind!=='annotator-bundle')return;
+  try{applyBundle(d);}catch(e){BUNDLE.error=String((e&&e.message)||e);}
+  if(ev.source){try{ev.source.postMessage({kind:'annotator-bundle-ack',device:DEVICE_ID},'*');
+    BUNDLE.ack_sent=true;}catch(e){BUNDLE.error=(BUNDLE.error?BUNDLE.error+' ':'')+'ack失败';}}});
+
+window.__M={
+  injectFeatText(s){loadFeatText(s);},
+  injectTimText(s){loadTimText(s);},
+  ejectTim(){M.tim=null;el('btnTim').textContent='timeline';el('btnTim').className='';},
+  setTime(t){M.playing=false;if(audioEl)audioEl.pause();M.t=t;render(t);},
+  state(){return{t:M.t,dur:durNow(),raf:window.__raf|0};},
+  selftest(){return window.__SELFTEST__;},
+  bundleState(){return window.__BUNDLE__;},
+  snap(w,h){w=w||158;h=h||96;const c2=document.createElement('canvas');c2.width=w;c2.height=h;
+    const g=c2.getContext('2d');g.fillStyle='#000';g.fillRect(0,0,w,h);g.drawImage(cv,0,0,w,h);
+    const d=g.getImageData(0,0,w,h).data;const out=new Uint8Array(w*h);
+    for(let i=0,j=0;i<d.length;i+=4,j++)out[j]=(d[i]*77+d[i+1]*151+d[i+2]*28)>>8;return out.join(',');}};
+window.__SELFTEST__={device:'H3-共鸣槽',label_collisions:null};
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
