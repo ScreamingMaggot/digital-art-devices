@@ -1,6 +1,7 @@
 """静态站验收：六入口、演示投递、D timeline、标注台送包（file:// 与 http 各一遍）。"""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -146,8 +147,12 @@ def main() -> int:
     try:
         with sync_playwright() as pw:
             br = pw.chromium.launch(channel="msedge", headless=True)
-            run(br, ROOT.as_uri())
-            run(br, "http://127.0.0.1:8765")
+            only = os.environ.get("SITE_BASE")
+            if only:
+                run(br, only.rstrip("/"))
+            else:
+                run(br, ROOT.as_uri())
+                run(br, "http://127.0.0.1:8765")
             br.close()
     finally:
         srv.terminate()
